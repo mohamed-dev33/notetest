@@ -5,9 +5,8 @@
  * Called after a freedraw element is finalized to optionally replace it
  * with a recognized shape or text element.
  *
- * Supports batch processing: multiple strokes drawn within a time window
- * are collected and recognized together (critical for multi-stroke
- * handwriting and complex shapes).
+ * Strategy: run both engines in parallel, pick the best result.
+ * For multi-stroke input, prefer handwriting (text is usually multi-stroke).
  */
 
 import type { ExcalidrawFreeDrawElement } from "@excalidraw/element/types";
@@ -31,16 +30,16 @@ export interface AIRecognitionResult {
   type: "shape" | "text" | "none";
   shape?: RecognizedShape;
   handwriting?: HandwritingResult;
-  // Which freedraw elements were consumed (for batch mode)
   consumedElements?: ExcalidrawFreeDrawElement[];
 }
 
-// Confidence thresholds
-const SHAPE_CONFIDENCE_THRESHOLD = 0.45;
-const HANDWRITING_CONFIDENCE_THRESHOLD = 35;
+// Higher thresholds = fewer false positives
+const SHAPE_CONFIDENCE_THRESHOLD = 0.70;
+const HANDWRITING_CONFIDENCE_THRESHOLD = 30;
 
 /**
  * Process a single freedraw element.
+ * Runs shape + handwriting in parallel, picks the best.
  */
 export async function processFreedrawElement(
   element: ExcalidrawFreeDrawElement,
@@ -59,74 +58,50 @@ export async function processFreedrawElement(
     return noResult;
   }
 
-  // Try shape recognition first (synchronous and fast)
+  // Run both in parallel
   let shapeResult: RecognizedShape | null = null;
-  if (shapeRecognitionEnabled) {
-    shapeResult = recognizeShape(points, element.x, element.y);
-  }
+  let hwResult: HandwritingResult | null = null;
 
-  const shapeMatched =
-    shapeResult &&
-    shapeResult.type !== "freedraw" &&
-    shapeResult.confidence >= SHAPE_CONFIDENCE_THRESHOLD;
+  const shapePromise = shapeRecognitionEnabled
+    ? Promise.resolve().then(() => {
+        shapeResult = recognizeShape(points, element.x, element.y);
+      })
+    : Promise.resolve();
 
-  const isClosedShape =
-    shapeMatched &&
-    shapeResult!.type !== "line" &&
-    shapeResult!.type !== "arrow";
+  const hwPromise = handwritingRecognitionEnabled
+    ? recognizeHandwriting(points, element.strokeWidth, true).then((r) => {
+        if (r.text.length > 0 && r.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD) {
+          hwResult = r;
+        }
+      })
+    : Promise.resolve();
 
-  if (isClosedShape) {
-    return {
-      type: "shape",
-      shape: shapeResult!,
-      consumedElements: [element],
-    };
-  }
+  await Promise.all([shapePromise, hwPromise]);
 
-  // For line/arrow shapes with good confidence, return immediately
-  const isStrongLineOrArrow =
-    shapeMatched &&
-    (shapeResult!.type === "line" || shapeResult!.type === "arrow") &&
-    shapeResult!.confidence >= 0.70;
+  const sr = shapeResult as RecognizedShape | null;
+  const hr = hwResult as HandwritingResult | null;
 
-  if (isStrongLineOrArrow) {
-    return {
-      type: "shape",
-      shape: shapeResult!,
-      consumedElements: [element],
-    };
-  }
+  const shapeValid =
+    sr !== null &&
+    sr.type !== "freedraw" &&
+    sr.confidence >= SHAPE_CONFIDENCE_THRESHOLD;
 
-  // For open strokes without strong shape match, try handwriting
-  if (handwritingRecognitionEnabled) {
-    const textLikely = looksLikeText(points);
-    if (textLikely || !shapeMatched) {
-      const hwResult = await recognizeHandwriting(
-        points,
-        element.strokeWidth,
-        true,
-      );
-
-      if (
-        hwResult.text.length > 0 &&
-        hwResult.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD
-      ) {
-        return {
-          type: "text",
-          handwriting: hwResult,
-          consumedElements: [element],
-        };
-      }
+  // If we have both, compare quality
+  if (shapeValid && hr) {
+    if (sr!.confidence >= 0.85) {
+      return { type: "shape", shape: sr!, consumedElements: [element] };
+    }
+    if (looksLikeText(points)) {
+      return { type: "text", handwriting: hr, consumedElements: [element] };
     }
   }
 
-  // Fall back to shape result (line/arrow)
-  if (shapeMatched) {
-    return {
-      type: "shape",
-      shape: shapeResult!,
-      consumedElements: [element],
-    };
+  if (shapeValid) {
+    return { type: "shape", shape: sr!, consumedElements: [element] };
+  }
+
+  if (hr) {
+    return { type: "text", handwriting: hr, consumedElements: [element] };
   }
 
   return noResult;
@@ -135,11 +110,10 @@ export async function processFreedrawElement(
 /**
  * Process a batch of freedraw elements drawn in quick succession.
  *
- * Strategy:
- * 1. Combine all strokes' points into one path and try shape recognition
- *    (handles multi-stroke shapes like arrow = line + head)
- * 2. Try multi-stroke handwriting recognition
- * 3. Fall back to single-element shape recognition on each element
+ * For multi-stroke input:
+ * - Run handwriting recognition (multi-stroke text is common)
+ * - Run shape recognition on combined points
+ * - Pick the best result
  */
 export async function processFreedrawBatch(
   elements: ExcalidrawFreeDrawElement[],
@@ -152,7 +126,7 @@ export async function processFreedrawBatch(
     return noResult;
   }
 
-  // Single element — delegate to single-element processor
+  // Single element — delegate
   if (elements.length === 1) {
     return processFreedrawElement(
       elements[0],
@@ -161,93 +135,103 @@ export async function processFreedrawBatch(
     );
   }
 
-  // --- Multi-stroke shape recognition ---
-  // Combine all strokes into a single point sequence (preserving global coords)
-  // so Protractor can recognize multi-stroke shapes (e.g. arrow = line + head)
-  if (shapeRecognitionEnabled) {
-    const combinedPoints: LocalPoint[] = [];
-    let globalMinX = Infinity, globalMinY = Infinity;
+  // --- Run both in parallel for multi-stroke ---
+  let shapeResult: RecognizedShape | null = null;
+  let hwResult: HandwritingResult | null = null;
 
-    // Compute global min to use as reference origin
-    for (const el of elements) {
-      for (const p of el.points as readonly LocalPoint[]) {
-        globalMinX = Math.min(globalMinX, el.x + p[0]);
-        globalMinY = Math.min(globalMinY, el.y + p[1]);
-      }
-    }
+  // Shape: combine all strokes into one path
+  const shapePromise = shapeRecognitionEnabled
+    ? Promise.resolve().then(() => {
+        const combinedPoints: LocalPoint[] = [];
+        let globalMinX = Infinity, globalMinY = Infinity;
 
-    // Combine all points into one sequence, translated to local coords
-    for (const el of elements) {
-      for (const p of el.points as readonly LocalPoint[]) {
-        combinedPoints.push(
-          [p[0] + el.x - globalMinX, p[1] + el.y - globalMinY] as LocalPoint,
-        );
-      }
-    }
+        for (const el of elements) {
+          for (const p of el.points as readonly LocalPoint[]) {
+            globalMinX = Math.min(globalMinX, el.x + p[0]);
+            globalMinY = Math.min(globalMinY, el.y + p[1]);
+          }
+        }
 
-    if (combinedPoints.length >= 5) {
-      const shapeResult = recognizeShape(combinedPoints, globalMinX, globalMinY);
-      if (
-        shapeResult.type !== "freedraw" &&
-        shapeResult.confidence >= SHAPE_CONFIDENCE_THRESHOLD
-      ) {
-        return {
-          type: "shape",
-          shape: shapeResult,
-          consumedElements: elements,
-        };
-      }
+        for (const el of elements) {
+          for (const p of el.points as readonly LocalPoint[]) {
+            combinedPoints.push(
+              [p[0] + el.x - globalMinX, p[1] + el.y - globalMinY] as LocalPoint,
+            );
+          }
+        }
+
+        if (combinedPoints.length >= 5) {
+          const result = recognizeShape(combinedPoints, globalMinX, globalMinY);
+          if (
+            result.type !== "freedraw" &&
+            result.confidence >= SHAPE_CONFIDENCE_THRESHOLD
+          ) {
+            shapeResult = result;
+          }
+        }
+      })
+    : Promise.resolve();
+
+  // Handwriting: multi-stroke recognition
+  const hwPromise = handwritingRecognitionEnabled
+    ? (async () => {
+        const allStrokes: { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[] = [];
+        for (const el of elements) {
+          if (el.points.length >= 2) {
+            allStrokes.push({
+              points: el.points as readonly LocalPoint[],
+              offsetX: el.x,
+              offsetY: el.y,
+            });
+          }
+        }
+
+        if (allStrokes.length > 0) {
+          const avgSW = elements.reduce((s, e) => s + e.strokeWidth, 0) / elements.length;
+          const result = await recognizeHandwritingMultiStroke(allStrokes, avgSW);
+          if (
+            result.text.length > 0 &&
+            result.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD
+          ) {
+            hwResult = result;
+          }
+        }
+      })()
+    : Promise.resolve();
+
+  await Promise.all([shapePromise, hwPromise]);
+
+  const sr = shapeResult as RecognizedShape | null;
+  const hr = hwResult as HandwritingResult | null;
+
+  // Multi-stroke: prefer handwriting over shape (text is usually multi-stroke)
+  if (hr && sr) {
+    // Only let shape win if it's very confident (>90%)
+    if (sr.confidence >= 0.90) {
+      return { type: "shape", shape: sr, consumedElements: elements };
     }
+    return { type: "text", handwriting: hr, consumedElements: elements };
   }
 
-  // --- Multi-stroke handwriting recognition ---
-  if (handwritingRecognitionEnabled) {
-    const allStrokes: { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[] = [];
-    for (const el of elements) {
-      if (el.points.length >= 2) {
-        allStrokes.push({
-          points: el.points as readonly LocalPoint[],
-          offsetX: el.x,
-          offsetY: el.y,
-        });
-      }
-    }
-
-    if (allStrokes.length > 0) {
-      const avgStrokeWidth = elements.reduce((s, e) => s + e.strokeWidth, 0) / elements.length;
-      const hwResult = await recognizeHandwritingMultiStroke(
-        allStrokes,
-        avgStrokeWidth,
-      );
-
-      if (
-        hwResult.text.length > 0 &&
-        hwResult.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD
-      ) {
-        return {
-          type: "text",
-          handwriting: hwResult,
-          consumedElements: elements,
-        };
-      }
-    }
+  if (hr) {
+    return { type: "text", handwriting: hr, consumedElements: elements };
   }
 
-  // --- Fallback: try each element individually for shape ---
+  if (sr) {
+    return { type: "shape", shape: sr, consumedElements: elements };
+  }
+
+  // Fallback: try each element individually for shape
   if (shapeRecognitionEnabled) {
     for (const el of elements) {
       const points = el.points as readonly LocalPoint[];
       if (points.length >= 5) {
-        const shapeResult = recognizeShape(points, el.x, el.y);
+        const result = recognizeShape(points, el.x, el.y);
         if (
-          shapeResult.type !== "freedraw" &&
-          shapeResult.confidence >= SHAPE_CONFIDENCE_THRESHOLD
+          result.type !== "freedraw" &&
+          result.confidence >= SHAPE_CONFIDENCE_THRESHOLD
         ) {
-          return {
-            type: "shape",
-            shape: shapeResult,
-            consumedElements: [el],
-          };
+          return { type: "shape", shape: result, consumedElements: [el] };
         }
       }
     }

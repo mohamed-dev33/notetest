@@ -466,59 +466,29 @@ async function recognizeWithTesseract(
     const worker = await ensureTesseract();
     if (!worker) { return noResult; }
 
-    let bestText = "";
-    let bestConf = 0;
-
-    // Try multiple page segmentation modes and pick the best result
-    const psmModes = [
-      "7",   // single text line
-      "8",   // single word
-      "6",   // uniform block of text
-      "13",  // raw line (no language model)
-    ];
-
-    for (const psm of psmModes) {
-      try {
-        await worker.setParameters({
-          tessedit_pageseg_mode: psm,
-          load_system_dawg: "0",
-          load_freq_dawg: "0",
-        });
-        const { data } = await worker.recognize(canvas);
-        const text = data.text.trim().replace(/\n+/g, " ");
-        const conf = data.confidence;
-
-        if (text.length > 0 && conf > bestConf) {
-          bestText = text;
-          bestConf = conf;
-        }
-
-        // Good enough — stop early
-        if (conf >= 75) { break; }
-      } catch {
-        // PSM mode failed — continue with next
-      }
-    }
-
-    // Reset to default PSM
+    // Use PSM 13 (raw line) — best for handwriting, no dictionary correction
     await worker.setParameters({
-      tessedit_pageseg_mode: "7",
+      tessedit_pageseg_mode: "13",
       load_system_dawg: "0",
       load_freq_dawg: "0",
     });
 
-    if (bestText.length === 0 || bestConf < 20) {
+    const { data } = await worker.recognize(canvas);
+    let text = data.text.trim().replace(/\n+/g, " ");
+    const conf = data.confidence;
+
+    if (text.length === 0 || conf < 15) {
       return noResult;
     }
 
     // Clean up common OCR artifacts
-    bestText = bestText
+    text = text
       .replace(/[|]/g, "l")
       .replace(/[{}[\]]/g, "")
       .replace(/\s{2,}/g, " ")
       .trim();
 
-    return { text: bestText, confidence: bestConf };
+    return { text, confidence: conf };
   } catch (e) {
     console.error("[AI] Tesseract recognition error:", e);
     return noResult;
