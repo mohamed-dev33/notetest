@@ -1,11 +1,13 @@
 /**
- * Handwriting Recognition Module — Tesseract.js (Web Worker)
+ * Handwriting Recognition Module — TrOCR (Web Worker) + Tesseract.js
  *
- * Uses Tesseract.js which runs OCR entirely in a Web Worker, keeping
- * the main thread free and responsive. No UI freezing.
+ * Primary engine: TrOCR (transformer-based, trained on IAM handwriting).
+ * Runs in a dedicated Web Worker so inference never blocks the UI.
  *
- * TrOCR was removed because it runs ONNX inference on the main thread,
- * causing the entire UI to freeze during recognition.
+ * Fallback engine: Tesseract.js (also runs in a Web Worker via its own
+ * internal worker mechanism).
+ *
+ * Both engines are non-blocking — the main thread stays responsive.
  */
 
 import type { LocalPoint } from "@excalidraw/math";
@@ -21,15 +23,12 @@ export interface HandwritingResult {
 
 /**
  * Render freedraw points to a high-quality canvas optimized for OCR.
- * - Scales to standard height (64px for TrOCR, 300 DPI equivalent)
- * - White background, black strokes
- * - Generous padding
- * - Anti-aliased smooth strokes
+ * Uses binarization with thick strokes on white background.
  */
 function renderPointsToCanvas(
   points: readonly LocalPoint[],
   strokeWidth: number = 3,
-  targetHeight: number = 64,
+  targetHeight: number = 300,
 ): HTMLCanvasElement | null {
   if (points.length < 2) {
     return null;
@@ -45,11 +44,10 @@ function renderPointsToCanvas(
 
   const rawW = maxX - minX;
   const rawH = maxY - minY;
-  if (rawW < 5 && rawH < 5) { return null; }
+  if (rawW < 3 && rawH < 3) { return null; }
 
-  // Scale so height = targetHeight, with generous padding
-  const padding = 16;
-  const scale = Math.max(1, targetHeight / Math.max(rawH, 1));
+  const padding = 32;
+  const scale = Math.max(1.5, targetHeight / Math.max(rawH, 1));
   const canvasW = Math.ceil(rawW * scale + padding * 2);
   const canvasH = Math.ceil(rawH * scale + padding * 2);
 
@@ -57,19 +55,18 @@ function renderPointsToCanvas(
   canvas.width = Math.max(canvasW, targetHeight);
   canvas.height = Math.max(canvasH, targetHeight);
 
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d")!;
   if (!ctx) { return null; }
 
   // White background
   ctx.fillStyle = "#FFFFFF";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Draw stroke with smooth anti-aliased lines
+  // Thick black strokes — thicker = clearer for OCR
   ctx.strokeStyle = "#000000";
-  ctx.lineWidth = Math.max(2, strokeWidth * scale * 0.8);
+  ctx.lineWidth = Math.max(4, strokeWidth * scale * 1.2);
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  ctx.imageSmoothingEnabled = true;
 
   ctx.beginPath();
   for (let i = 0; i < points.length; i++) {
@@ -78,7 +75,6 @@ function renderPointsToCanvas(
     if (i === 0) {
       ctx.moveTo(x, y);
     } else {
-      // Use quadratic curves for smoother rendering
       const prev = points[i - 1];
       const prevX = (prev[0] - minX) * scale + padding;
       const prevY = (prev[1] - minY) * scale + padding;
@@ -92,18 +88,105 @@ function renderPointsToCanvas(
   return canvas;
 }
 
-/**
- * Render to a larger canvas for Tesseract (needs higher res)
- */
-function renderForTesseract(
-  points: readonly LocalPoint[],
-  strokeWidth: number = 3,
-): HTMLCanvasElement | null {
-  return renderPointsToCanvas(points, strokeWidth, 200);
+// =====================================================================
+// TrOCR Engine via Web Worker (Primary — non-blocking, accurate)
+// =====================================================================
+
+let trOcrWorker: Worker | null = null;
+let trOcrReady = false;
+let trOcrLoading = false;
+let trOcrLoadPromise: Promise<boolean> | null = null;
+let trOcrRequestId = 0;
+
+function ensureTrOcrWorker(): Promise<boolean> {
+  if (trOcrReady) { return Promise.resolve(true); }
+  if (trOcrLoading && trOcrLoadPromise) { return trOcrLoadPromise; }
+
+  trOcrLoading = true;
+  trOcrLoadPromise = new Promise<boolean>((resolve) => {
+    try {
+      trOcrWorker = new Worker(
+        new URL("./trOcrWorker.ts", import.meta.url),
+        { type: "module" },
+      );
+
+      const timeout = setTimeout(() => {
+        console.warn("[AI] TrOCR worker init timed out (120s)");
+        trOcrLoading = false;
+        resolve(false);
+      }, 120000);
+
+      trOcrWorker.onmessage = (e) => {
+        if (e.data.type === "ready") {
+          clearTimeout(timeout);
+          trOcrReady = true;
+          trOcrLoading = false;
+          console.log("[AI] TrOCR Web Worker ready");
+          resolve(true);
+        } else if (e.data.type === "error" && !trOcrReady) {
+          clearTimeout(timeout);
+          console.warn("[AI] TrOCR worker init error:", e.data.message);
+          trOcrLoading = false;
+          resolve(false);
+        }
+      };
+
+      trOcrWorker.onerror = (err) => {
+        clearTimeout(timeout);
+        console.warn("[AI] TrOCR worker error:", err);
+        trOcrLoading = false;
+        resolve(false);
+      };
+
+      trOcrWorker.postMessage({ type: "init" });
+    } catch (err) {
+      console.warn("[AI] TrOCR worker creation failed:", err);
+      trOcrLoading = false;
+      resolve(false);
+    }
+  });
+
+  return trOcrLoadPromise;
+}
+
+function recognizeWithTrOcrWorker(
+  canvas: HTMLCanvasElement,
+): Promise<HandwritingResult> {
+  return new Promise((resolve) => {
+    if (!trOcrWorker || !trOcrReady) {
+      resolve({ text: "", confidence: 0 });
+      return;
+    }
+
+    const id = ++trOcrRequestId;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) { resolve({ text: "", confidence: 0 }); return; }
+
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+    const timeout = setTimeout(() => {
+      resolve({ text: "", confidence: 0 });
+    }, 30000);
+
+    const handler = (e: MessageEvent) => {
+      if (e.data.id !== id) { return; }
+      clearTimeout(timeout);
+      trOcrWorker?.removeEventListener("message", handler);
+
+      if (e.data.type === "result") {
+        resolve({ text: e.data.text || "", confidence: e.data.confidence || 0 });
+      } else {
+        resolve({ text: "", confidence: 0 });
+      }
+    };
+
+    trOcrWorker.addEventListener("message", handler);
+    trOcrWorker.postMessage({ type: "recognize", imageData, id });
+  });
 }
 
 // =====================================================================
-// Tesseract.js Engine (Web Worker — non-blocking)
+// Tesseract.js Engine (Fallback — also non-blocking via internal worker)
 // =====================================================================
 
 let tesseractWorker: any = null;
@@ -124,11 +207,18 @@ async function ensureTesseract(): Promise<any> {
       tesseractWorker = await Tesseract.createWorker("eng", 1, {
         logger: () => {},
       });
-      // Try multiple page segmentation modes for best results
+      // CRITICAL: Disable dictionary-based word correction
+      // This prevents Tesseract from "fixing" handwritten text
+      // (e.g. "youssef" → "you say" or "gogst")
       await tesseractWorker.setParameters({
-        tessedit_pageseg_mode: "7", // single text line
+        tessedit_pageseg_mode: "7",
         preserve_interword_spaces: "1",
+        load_system_dawg: "0",
+        load_freq_dawg: "0",
+        language_model_penalty_non_dict_word: "0",
+        language_model_penalty_non_freq_dict_word: "0",
       });
+      console.log("[AI] Tesseract worker ready (dictionary disabled)");
     } catch (e) {
       console.error("[AI] Tesseract initialization failed:", e);
       tesseractWorker = null;
@@ -149,28 +239,59 @@ async function recognizeWithTesseract(
     const worker = await ensureTesseract();
     if (!worker) { return noResult; }
 
-    // Try PSM 7 (single text line) first
-    const { data } = await worker.recognize(canvas);
-    let text = data.text.trim().replace(/\n+/g, " ");
-    let confidence = data.confidence;
+    let bestText = "";
+    let bestConf = 0;
 
-    // If low confidence, try PSM 8 (single word)
-    if (confidence < 50 && text.length > 0) {
-      await worker.setParameters({ tessedit_pageseg_mode: "8" });
-      const { data: data2 } = await worker.recognize(canvas);
-      if (data2.confidence > confidence) {
-        text = data2.text.trim().replace(/\n+/g, " ");
-        confidence = data2.confidence;
+    // Try multiple page segmentation modes and pick the best result
+    const psmModes = [
+      "7",   // single text line
+      "8",   // single word
+      "6",   // uniform block of text
+      "13",  // raw line (no language model)
+    ];
+
+    for (const psm of psmModes) {
+      try {
+        await worker.setParameters({
+          tessedit_pageseg_mode: psm,
+          load_system_dawg: "0",
+          load_freq_dawg: "0",
+        });
+        const { data } = await worker.recognize(canvas);
+        const text = data.text.trim().replace(/\n+/g, " ");
+        const conf = data.confidence;
+
+        if (text.length > 0 && conf > bestConf) {
+          bestText = text;
+          bestConf = conf;
+        }
+
+        // Good enough — stop early
+        if (conf >= 75) { break; }
+      } catch {
+        // PSM mode failed — continue with next
       }
-      // Reset to PSM 7
-      await worker.setParameters({ tessedit_pageseg_mode: "7" });
     }
 
-    if (text.length === 0 || confidence < 25) {
+    // Reset to default PSM
+    await worker.setParameters({
+      tessedit_pageseg_mode: "7",
+      load_system_dawg: "0",
+      load_freq_dawg: "0",
+    });
+
+    if (bestText.length === 0 || bestConf < 20) {
       return noResult;
     }
 
-    return { text, confidence };
+    // Clean up common OCR artifacts
+    bestText = bestText
+      .replace(/[|]/g, "l")
+      .replace(/[{}[\]]/g, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+
+    return { text: bestText, confidence: bestConf };
   } catch (e) {
     console.error("[AI] Tesseract recognition error:", e);
     return noResult;
@@ -181,10 +302,6 @@ async function recognizeWithTesseract(
 // Text Detection Heuristic
 // =====================================================================
 
-/**
- * Heuristic to detect if a stroke likely represents handwritten text.
- * Checks direction changes, aspect ratio, and path complexity.
- */
 export function looksLikeText(points: readonly LocalPoint[]): boolean {
   if (points.length < 6) { return false; }
 
@@ -198,9 +315,8 @@ export function looksLikeText(points: readonly LocalPoint[]): boolean {
 
   const width = maxX - minX;
   const height = maxY - minY;
-  if (width < 10 || height < 5) { return false; }
+  if (width < 8 || height < 4) { return false; }
 
-  // Count direction changes — text has many
   let dirChanges = 0;
   for (let i = 2; i < points.length; i++) {
     const dx1 = points[i - 1][0] - points[i - 2][0];
@@ -212,32 +328,26 @@ export function looksLikeText(points: readonly LocalPoint[]): boolean {
       const prevDx1 = points[i - 2][0] - points[i - 3][0];
       const prevDy1 = points[i - 2][1] - points[i - 3][1];
       const prevCross = prevDx1 * dy1 - prevDy1 * dx1;
-      if (Math.sign(cross) !== Math.sign(prevCross) && Math.abs(cross) > 0.3) {
+      if (Math.sign(cross) !== Math.sign(prevCross) && Math.abs(cross) > 0.2) {
         dirChanges++;
       }
     }
   }
 
-  return dirChanges / points.length > 0.06;
+  return dirChanges / points.length > 0.05;
 }
 
 // =====================================================================
 // Multi-Stroke Canvas Rendering
 // =====================================================================
 
-/**
- * Render multiple freedraw strokes onto a single canvas for OCR.
- * Each stroke has its own points and a global offset (element x, y).
- * Strokes are combined into one image preserving spatial relationships.
- */
 function renderMultiStrokeToCanvas(
   strokes: readonly { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[],
   strokeWidth: number = 3,
-  targetHeight: number = 64,
+  targetHeight: number = 200,
 ): HTMLCanvasElement | null {
   if (strokes.length === 0) { return null; }
 
-  // Compute global bounding box across all strokes
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const stroke of strokes) {
     for (const p of stroke.points) {
@@ -252,10 +362,10 @@ function renderMultiStrokeToCanvas(
 
   const rawW = maxX - minX;
   const rawH = maxY - minY;
-  if (rawW < 5 && rawH < 5) { return null; }
+  if (rawW < 3 && rawH < 3) { return null; }
 
-  const padding = 16;
-  const scale = Math.max(1, targetHeight / Math.max(rawH, 1));
+  const padding = 32;
+  const scale = Math.max(1.5, targetHeight / Math.max(rawH, 1));
   const canvasW = Math.ceil(rawW * scale + padding * 2);
   const canvasH = Math.ceil(rawH * scale + padding * 2);
 
@@ -263,19 +373,17 @@ function renderMultiStrokeToCanvas(
   canvas.width = Math.max(canvasW, targetHeight);
   canvas.height = Math.max(canvasH, targetHeight);
 
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d")!;
   if (!ctx) { return null; }
 
   ctx.fillStyle = "#FFFFFF";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   ctx.strokeStyle = "#000000";
-  ctx.lineWidth = Math.max(2, strokeWidth * scale * 0.8);
+  ctx.lineWidth = Math.max(4, strokeWidth * scale * 1.2);
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  ctx.imageSmoothingEnabled = true;
 
-  // Draw each stroke
   for (const stroke of strokes) {
     if (stroke.points.length < 2) { continue; }
     ctx.beginPath();
@@ -305,7 +413,7 @@ function renderMultiStrokeToCanvas(
 
 /**
  * Recognize handwritten text from freedraw points (single stroke).
- * Uses Tesseract.js running in a Web Worker (non-blocking).
+ * TrOCR (Web Worker, non-blocking) → Tesseract fallback.
  */
 export async function recognizeHandwriting(
   points: readonly LocalPoint[],
@@ -318,11 +426,36 @@ export async function recognizeHandwriting(
     return noResult;
   }
 
-  const tessCanvas = renderForTesseract(points, strokeWidth);
-  if (tessCanvas) {
-    const tessResult = await recognizeWithTesseract(tessCanvas);
-    if (tessResult.text.length > 0 && tessResult.confidence >= 30) {
-      return tessResult;
+  // Run BOTH engines in parallel and pick the best result
+  const results: HandwritingResult[] = [];
+
+  // TrOCR (128px height, optimized for transformer model)
+  const trOcrPromise = trOcrReady
+    ? (async () => {
+        const trCanvas = renderPointsToCanvas(points, strokeWidth, 128);
+        if (trCanvas) {
+          const r = await recognizeWithTrOcrWorker(trCanvas);
+          if (r.text.length > 0) { results.push(r); }
+        }
+      })()
+    : Promise.resolve();
+
+  // Tesseract (300px height for traditional OCR)
+  const tessPromise = (async () => {
+    const tessCanvas = renderPointsToCanvas(points, strokeWidth, 300);
+    if (tessCanvas) {
+      const r = await recognizeWithTesseract(tessCanvas);
+      if (r.text.length > 0) { results.push(r); }
+    }
+  })();
+
+  await Promise.all([trOcrPromise, tessPromise]);
+
+  // Pick highest confidence result
+  if (results.length > 0) {
+    results.sort((a, b) => b.confidence - a.confidence);
+    if (results[0].confidence >= 20) {
+      return results[0];
     }
   }
 
@@ -331,8 +464,7 @@ export async function recognizeHandwriting(
 
 /**
  * Recognize handwritten text from multiple strokes combined.
- * All strokes are rendered onto a single canvas preserving
- * their spatial positions, then fed to Tesseract OCR (Web Worker).
+ * TrOCR (Web Worker) → Tesseract fallback.
  */
 export async function recognizeHandwritingMultiStroke(
   strokes: readonly { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[],
@@ -342,11 +474,33 @@ export async function recognizeHandwritingMultiStroke(
 
   if (strokes.length === 0) { return noResult; }
 
-  const tessCanvas = renderMultiStrokeToCanvas(strokes, strokeWidth, 200);
-  if (tessCanvas) {
-    const tessResult = await recognizeWithTesseract(tessCanvas);
-    if (tessResult.text.length > 0 && tessResult.confidence >= 30) {
-      return tessResult;
+  // Run BOTH engines in parallel and pick the best result
+  const results: HandwritingResult[] = [];
+
+  const trOcrPromise = trOcrReady
+    ? (async () => {
+        const trCanvas = renderMultiStrokeToCanvas(strokes, strokeWidth, 128);
+        if (trCanvas) {
+          const r = await recognizeWithTrOcrWorker(trCanvas);
+          if (r.text.length > 0) { results.push(r); }
+        }
+      })()
+    : Promise.resolve();
+
+  const tessPromise = (async () => {
+    const tessCanvas = renderMultiStrokeToCanvas(strokes, strokeWidth, 300);
+    if (tessCanvas) {
+      const r = await recognizeWithTesseract(tessCanvas);
+      if (r.text.length > 0) { results.push(r); }
+    }
+  })();
+
+  await Promise.all([trOcrPromise, tessPromise]);
+
+  if (results.length > 0) {
+    results.sort((a, b) => b.confidence - a.confidence);
+    if (results[0].confidence >= 20) {
+      return results[0];
     }
   }
 
@@ -354,18 +508,28 @@ export async function recognizeHandwritingMultiStroke(
 }
 
 /**
- * Pre-initialize Tesseract engine (call when handwriting recognition is enabled)
+ * Pre-initialize both engines (call when handwriting recognition is enabled).
+ * TrOCR loads in background — Tesseract is available immediately as fallback.
  */
 export async function preloadHandwritingEngine(): Promise<void> {
+  // Start both in parallel — neither blocks the main thread
+  ensureTrOcrWorker().catch(() => {});
   await ensureTesseract().catch(() => {});
 }
 
 /**
- * Terminate engine when no longer needed
+ * Terminate engines when no longer needed
  */
 export async function terminateHandwritingEngine(): Promise<void> {
   if (tesseractWorker) {
     try { await tesseractWorker.terminate(); } catch { /* ignore */ }
     tesseractWorker = null;
+  }
+  if (trOcrWorker) {
+    trOcrWorker.terminate();
+    trOcrWorker = null;
+    trOcrReady = false;
+    trOcrLoading = false;
+    trOcrLoadPromise = null;
   }
 }

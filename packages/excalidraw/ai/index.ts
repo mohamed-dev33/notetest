@@ -83,10 +83,24 @@ export async function processFreedrawElement(
     };
   }
 
-  // For open strokes, try handwriting first
+  // For line/arrow shapes with good confidence, return immediately
+  const isStrongLineOrArrow =
+    shapeMatched &&
+    (shapeResult!.type === "line" || shapeResult!.type === "arrow") &&
+    shapeResult!.confidence >= 0.70;
+
+  if (isStrongLineOrArrow) {
+    return {
+      type: "shape",
+      shape: shapeResult!,
+      consumedElements: [element],
+    };
+  }
+
+  // For open strokes without strong shape match, try handwriting
   if (handwritingRecognitionEnabled) {
     const textLikely = looksLikeText(points);
-    if (textLikely || !isClosedShape) {
+    if (textLikely || !shapeMatched) {
       const hwResult = await recognizeHandwriting(
         points,
         element.strokeWidth,
