@@ -205,13 +205,6 @@ export const SelectedShapeActions = ({
         targetElements.some((element) => element.type === "freedraw")) &&
         renderAction("changeStrokeShape")}
 
-      {appState.activeTool.type === "freedraw" && (
-        <>
-          {renderAction("aiShapeRecognition")}
-          {renderAction("aiHandwritingRecognition")}
-        </>
-      )}
-
       {(hasStrokeStyle(appState.activeTool.type) ||
         targetElements.some((element) => hasStrokeStyle(element.type))) && (
         <>
@@ -1188,6 +1181,50 @@ export const ShapesSwitcher = ({
         },
       )}
       <div className="App-toolbar__divider" />
+
+      {activeTool.type === "freedraw" && (
+        <>
+          <ToolButton
+            type="icon"
+            icon={<span style={{ fontSize: 16 }}>🔷</span>}
+            title="AI Shape Recognition"
+            aria-label="AI Shape Recognition"
+            className={clsx("Shape", {
+              fillable: app.state.aiShapeRecognitionEnabled,
+            })}
+            data-testid="toolbar-ai-shape"
+            selected={app.state.aiShapeRecognitionEnabled}
+            onClick={() => {
+              setAppState((s: any) => ({
+                aiShapeRecognitionEnabled: !s.aiShapeRecognitionEnabled,
+              }));
+            }}
+          />
+          <ToolButton
+            type="icon"
+            icon={<span style={{ fontSize: 16 }}>✍️</span>}
+            title="AI Handwriting Recognition"
+            aria-label="AI Handwriting Recognition"
+            className={clsx("Shape", {
+              fillable: app.state.aiHandwritingRecognitionEnabled,
+            })}
+            data-testid="toolbar-ai-handwriting"
+            selected={app.state.aiHandwritingRecognitionEnabled}
+            onClick={() => {
+              setAppState((s: any) => ({
+                aiHandwritingRecognitionEnabled:
+                  !s.aiHandwritingRecognitionEnabled,
+              }));
+              if (!app.state.aiHandwritingRecognitionEnabled) {
+                import("../ai").then(({ preloadHandwritingEngine }) =>
+                  preloadHandwritingEngine(),
+                );
+              }
+            }}
+          />
+          <div className="App-toolbar__divider" />
+        </>
+      )}
 
       <DropdownMenu open={isExtraToolsMenuOpen}>
         <DropdownMenu.Trigger

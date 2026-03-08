@@ -22,9 +22,17 @@ async function loadModel() {
   if (env.backends?.onnx?.wasm) {
     env.backends.onnx.wasm.numThreads = 1;
   }
-  pipe = await pipeline("image-to-text", "Xenova/trocr-small-handwritten", {
-    quantized: true,
-  });
+  // Use base model for better accuracy (larger but much more accurate)
+  try {
+    pipe = await pipeline("image-to-text", "Xenova/trocr-base-handwritten", {
+      quantized: true,
+    });
+  } catch {
+    // Fallback to small model if base fails to load
+    pipe = await pipeline("image-to-text", "Xenova/trocr-small-handwritten", {
+      quantized: true,
+    });
+  }
 }
 
 /**
@@ -67,9 +75,17 @@ self.onmessage = async (e: MessageEvent) => {
         if (results && results.length > 0) {
           const text = (results[0].generated_text || "").trim();
           if (text.length > 0) {
+            // Score based on text quality
             const hasAlphanumeric = /[a-zA-Z0-9]/.test(text);
-            const confidence = hasAlphanumeric ? 85 : 40;
-            self.postMessage({ type: "result", text, confidence, id });
+            const hasReasonableLength = text.length >= 2 && text.length <= 200;
+            const hasNoGarbage = !/[^\x20-\x7E]/.test(text); // only printable ASCII
+            let confidence = 50;
+            if (hasAlphanumeric) { confidence += 20; }
+            if (hasReasonableLength) { confidence += 15; }
+            if (hasNoGarbage) { confidence += 10; }
+            // Boost for word-like patterns
+            if (/^[a-zA-Z]+$/.test(text)) { confidence += 5; }
+            self.postMessage({ type: "result", text, confidence: Math.min(95, confidence), id });
             return;
           }
         }

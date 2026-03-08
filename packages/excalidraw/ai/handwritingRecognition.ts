@@ -18,21 +18,19 @@ export interface HandwritingResult {
 }
 
 // =====================================================================
-// Canvas Preprocessing — Critical for OCR accuracy
+// Canvas Preprocessing — separate rendering for each engine
 // =====================================================================
 
 /**
- * Render freedraw points to a high-quality canvas optimized for OCR.
- * Uses binarization with thick strokes on white background.
+ * Render points for TrOCR — natural-looking handwriting.
+ * TrOCR was trained on IAM dataset: dark gray ink on light background,
+ * anti-aliased, ~384px height images. NO binarization.
  */
-function renderPointsToCanvas(
+function renderForTrOCR(
   points: readonly LocalPoint[],
   strokeWidth: number = 3,
-  targetHeight: number = 300,
 ): HTMLCanvasElement | null {
-  if (points.length < 2) {
-    return null;
-  }
+  if (points.length < 2) { return null; }
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const p of points) {
@@ -46,23 +44,89 @@ function renderPointsToCanvas(
   const rawH = maxY - minY;
   if (rawW < 3 && rawH < 3) { return null; }
 
-  const padding = 48;
-  const scale = Math.max(2.0, targetHeight / Math.max(rawH, 1));
+  // TrOCR expects ~384px height with proper aspect ratio
+  const targetH = 384;
+  const padding = 40;
+  const scale = Math.max(2.0, targetH / Math.max(rawH, 1));
   const canvasW = Math.ceil(rawW * scale + padding * 2);
   const canvasH = Math.ceil(rawH * scale + padding * 2);
 
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(canvasW, targetHeight);
-  canvas.height = Math.max(canvasH, targetHeight);
+  canvas.width = Math.max(canvasW, 384);
+  canvas.height = Math.max(canvasH, 384);
 
   const ctx = canvas.getContext("2d")!;
   if (!ctx) { return null; }
 
-  // White background
+  // Light gray background (like paper)
+  ctx.fillStyle = "#F8F8F8";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Dark gray strokes (like ink pen) — anti-aliased naturally
+  ctx.strokeStyle = "#1A1A1A";
+  ctx.lineWidth = Math.max(3, strokeWidth * scale * 0.8);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  ctx.beginPath();
+  for (let i = 0; i < points.length; i++) {
+    const x = (points[i][0] - minX) * scale + padding;
+    const y = (points[i][1] - minY) * scale + padding;
+    if (i === 0) {
+      ctx.moveTo(x, y);
+    } else {
+      const prev = points[i - 1];
+      const prevX = (prev[0] - minX) * scale + padding;
+      const prevY = (prev[1] - minY) * scale + padding;
+      const midX = (prevX + x) / 2;
+      const midY = (prevY + y) / 2;
+      ctx.quadraticCurveTo(prevX, prevY, midX, midY);
+    }
+  }
+  ctx.stroke();
+
+  // NO binarization — TrOCR handles anti-aliased text better
+  return canvas;
+}
+
+/**
+ * Render points for Tesseract — high-contrast binarized image.
+ * Tesseract works best with pure black text on white background.
+ */
+function renderForTesseract(
+  points: readonly LocalPoint[],
+  strokeWidth: number = 3,
+): HTMLCanvasElement | null {
+  if (points.length < 2) { return null; }
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of points) {
+    minX = Math.min(minX, p[0]);
+    minY = Math.min(minY, p[1]);
+    maxX = Math.max(maxX, p[0]);
+    maxY = Math.max(maxY, p[1]);
+  }
+
+  const rawW = maxX - minX;
+  const rawH = maxY - minY;
+  if (rawW < 3 && rawH < 3) { return null; }
+
+  const targetH = 400;
+  const padding = 48;
+  const scale = Math.max(2.0, targetH / Math.max(rawH, 1));
+  const canvasW = Math.ceil(rawW * scale + padding * 2);
+  const canvasH = Math.ceil(rawH * scale + padding * 2);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(canvasW, targetH);
+  canvas.height = Math.max(canvasH, targetH);
+
+  const ctx = canvas.getContext("2d")!;
+  if (!ctx) { return null; }
+
   ctx.fillStyle = "#FFFFFF";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Thick black strokes — thicker = clearer for OCR
   ctx.strokeStyle = "#000000";
   ctx.lineWidth = Math.max(6, strokeWidth * scale * 1.5);
   ctx.lineCap = "round";
@@ -85,8 +149,157 @@ function renderPointsToCanvas(
   }
   ctx.stroke();
 
-  // Binarize: force each pixel to pure black or pure white
-  // Use a gentler threshold to preserve thin strokes
+  // Binarize for Tesseract
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+    const val = gray < 200 ? 0 : 255;
+    data[i] = val;
+    data[i + 1] = val;
+    data[i + 2] = val;
+  }
+  ctx.putImageData(imgData, 0, 0);
+
+  return canvas;
+}
+
+/**
+ * Multi-stroke rendering for TrOCR
+ */
+function renderMultiStrokeForTrOCR(
+  strokes: readonly { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[],
+  strokeWidth: number = 3,
+): HTMLCanvasElement | null {
+  if (strokes.length === 0) { return null; }
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const stroke of strokes) {
+    for (const p of stroke.points) {
+      const gx = p[0] + stroke.offsetX;
+      const gy = p[1] + stroke.offsetY;
+      minX = Math.min(minX, gx);
+      minY = Math.min(minY, gy);
+      maxX = Math.max(maxX, gx);
+      maxY = Math.max(maxY, gy);
+    }
+  }
+
+  const rawW = maxX - minX;
+  const rawH = maxY - minY;
+  if (rawW < 3 && rawH < 3) { return null; }
+
+  const targetH = 384;
+  const padding = 40;
+  const scale = Math.max(2.0, targetH / Math.max(rawH, 1));
+  const canvasW = Math.ceil(rawW * scale + padding * 2);
+  const canvasH = Math.ceil(rawH * scale + padding * 2);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(canvasW, 384);
+  canvas.height = Math.max(canvasH, 384);
+
+  const ctx = canvas.getContext("2d")!;
+  if (!ctx) { return null; }
+
+  ctx.fillStyle = "#F8F8F8";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = "#1A1A1A";
+  ctx.lineWidth = Math.max(3, strokeWidth * scale * 0.8);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  for (const stroke of strokes) {
+    if (stroke.points.length < 2) { continue; }
+    ctx.beginPath();
+    for (let i = 0; i < stroke.points.length; i++) {
+      const x = (stroke.points[i][0] + stroke.offsetX - minX) * scale + padding;
+      const y = (stroke.points[i][1] + stroke.offsetY - minY) * scale + padding;
+      if (i === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        const prev = stroke.points[i - 1];
+        const prevX = (prev[0] + stroke.offsetX - minX) * scale + padding;
+        const prevY = (prev[1] + stroke.offsetY - minY) * scale + padding;
+        const midX = (prevX + x) / 2;
+        const midY = (prevY + y) / 2;
+        ctx.quadraticCurveTo(prevX, prevY, midX, midY);
+      }
+    }
+    ctx.stroke();
+  }
+
+  return canvas;
+}
+
+/**
+ * Multi-stroke rendering for Tesseract (binarized)
+ */
+function renderMultiStrokeForTesseract(
+  strokes: readonly { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[],
+  strokeWidth: number = 3,
+): HTMLCanvasElement | null {
+  if (strokes.length === 0) { return null; }
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const stroke of strokes) {
+    for (const p of stroke.points) {
+      const gx = p[0] + stroke.offsetX;
+      const gy = p[1] + stroke.offsetY;
+      minX = Math.min(minX, gx);
+      minY = Math.min(minY, gy);
+      maxX = Math.max(maxX, gx);
+      maxY = Math.max(maxY, gy);
+    }
+  }
+
+  const rawW = maxX - minX;
+  const rawH = maxY - minY;
+  if (rawW < 3 && rawH < 3) { return null; }
+
+  const targetH = 400;
+  const padding = 48;
+  const scale = Math.max(2.0, targetH / Math.max(rawH, 1));
+  const canvasW = Math.ceil(rawW * scale + padding * 2);
+  const canvasH = Math.ceil(rawH * scale + padding * 2);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(canvasW, targetH);
+  canvas.height = Math.max(canvasH, targetH);
+
+  const ctx = canvas.getContext("2d")!;
+  if (!ctx) { return null; }
+
+  ctx.fillStyle = "#FFFFFF";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = "#000000";
+  ctx.lineWidth = Math.max(6, strokeWidth * scale * 1.5);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  for (const stroke of strokes) {
+    if (stroke.points.length < 2) { continue; }
+    ctx.beginPath();
+    for (let i = 0; i < stroke.points.length; i++) {
+      const x = (stroke.points[i][0] + stroke.offsetX - minX) * scale + padding;
+      const y = (stroke.points[i][1] + stroke.offsetY - minY) * scale + padding;
+      if (i === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        const prev = stroke.points[i - 1];
+        const prevX = (prev[0] + stroke.offsetX - minX) * scale + padding;
+        const prevY = (prev[1] + stroke.offsetY - minY) * scale + padding;
+        const midX = (prevX + x) / 2;
+        const midY = (prevY + y) / 2;
+        ctx.quadraticCurveTo(prevX, prevY, midX, midY);
+      }
+    }
+    ctx.stroke();
+  }
+
+  // Binarize
   const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const data = imgData.data;
   for (let i = 0; i < data.length; i += 4) {
@@ -352,94 +565,12 @@ export function looksLikeText(points: readonly LocalPoint[]): boolean {
 }
 
 // =====================================================================
-// Multi-Stroke Canvas Rendering
-// =====================================================================
-
-function renderMultiStrokeToCanvas(
-  strokes: readonly { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[],
-  strokeWidth: number = 3,
-  targetHeight: number = 200,
-): HTMLCanvasElement | null {
-  if (strokes.length === 0) { return null; }
-
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const stroke of strokes) {
-    for (const p of stroke.points) {
-      const gx = p[0] + stroke.offsetX;
-      const gy = p[1] + stroke.offsetY;
-      minX = Math.min(minX, gx);
-      minY = Math.min(minY, gy);
-      maxX = Math.max(maxX, gx);
-      maxY = Math.max(maxY, gy);
-    }
-  }
-
-  const rawW = maxX - minX;
-  const rawH = maxY - minY;
-  if (rawW < 3 && rawH < 3) { return null; }
-
-  const padding = 48;
-  const scale = Math.max(2.0, targetHeight / Math.max(rawH, 1));
-  const canvasW = Math.ceil(rawW * scale + padding * 2);
-  const canvasH = Math.ceil(rawH * scale + padding * 2);
-
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(canvasW, targetHeight);
-  canvas.height = Math.max(canvasH, targetHeight);
-
-  const ctx = canvas.getContext("2d")!;
-  if (!ctx) { return null; }
-
-  ctx.fillStyle = "#FFFFFF";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  ctx.strokeStyle = "#000000";
-  ctx.lineWidth = Math.max(6, strokeWidth * scale * 1.5);
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-
-  for (const stroke of strokes) {
-    if (stroke.points.length < 2) { continue; }
-    ctx.beginPath();
-    for (let i = 0; i < stroke.points.length; i++) {
-      const x = (stroke.points[i][0] + stroke.offsetX - minX) * scale + padding;
-      const y = (stroke.points[i][1] + stroke.offsetY - minY) * scale + padding;
-      if (i === 0) {
-        ctx.moveTo(x, y);
-      } else {
-        const prev = stroke.points[i - 1];
-        const prevX = (prev[0] + stroke.offsetX - minX) * scale + padding;
-        const prevY = (prev[1] + stroke.offsetY - minY) * scale + padding;
-        const midX = (prevX + x) / 2;
-        const midY = (prevY + y) / 2;
-        ctx.quadraticCurveTo(prevX, prevY, midX, midY);
-      }
-    }
-    ctx.stroke();
-  }
-
-  // Binarize for clean OCR input
-  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const data = imgData.data;
-  for (let i = 0; i < data.length; i += 4) {
-    const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
-    const val = gray < 200 ? 0 : 255;
-    data[i] = val;
-    data[i + 1] = val;
-    data[i + 2] = val;
-  }
-  ctx.putImageData(imgData, 0, 0);
-
-  return canvas;
-}
-
-// =====================================================================
 // Public API
 // =====================================================================
 
 /**
  * Recognize handwritten text from freedraw points (single stroke).
- * TrOCR (Web Worker, non-blocking) → Tesseract fallback.
+ * TrOCR (Web Worker, non-blocking) + Tesseract in parallel, best wins.
  */
 export async function recognizeHandwriting(
   points: readonly LocalPoint[],
@@ -452,13 +583,12 @@ export async function recognizeHandwriting(
     return noResult;
   }
 
-  // Run BOTH engines in parallel and pick the best result
   const results: HandwritingResult[] = [];
 
-  // TrOCR (128px height, optimized for transformer model)
+  // TrOCR with proper IAM-style rendering (384px, no binarization)
   const trOcrPromise = trOcrReady
     ? (async () => {
-        const trCanvas = renderPointsToCanvas(points, strokeWidth, 128);
+        const trCanvas = renderForTrOCR(points, strokeWidth);
         if (trCanvas) {
           const r = await recognizeWithTrOcrWorker(trCanvas);
           if (r.text.length > 0) { results.push(r); }
@@ -466,9 +596,9 @@ export async function recognizeHandwriting(
       })()
     : Promise.resolve();
 
-  // Tesseract (400px height for traditional OCR — higher res = better accuracy)
+  // Tesseract with binarized rendering (400px)
   const tessPromise = (async () => {
-    const tessCanvas = renderPointsToCanvas(points, strokeWidth, 400);
+    const tessCanvas = renderForTesseract(points, strokeWidth);
     if (tessCanvas) {
       const r = await recognizeWithTesseract(tessCanvas);
       if (r.text.length > 0) { results.push(r); }
@@ -477,7 +607,6 @@ export async function recognizeHandwriting(
 
   await Promise.all([trOcrPromise, tessPromise]);
 
-  // Pick highest confidence result
   if (results.length > 0) {
     results.sort((a, b) => b.confidence - a.confidence);
     if (results[0].confidence >= 20) {
@@ -490,7 +619,7 @@ export async function recognizeHandwriting(
 
 /**
  * Recognize handwritten text from multiple strokes combined.
- * TrOCR (Web Worker) → Tesseract fallback.
+ * TrOCR (Web Worker) + Tesseract in parallel, best wins.
  */
 export async function recognizeHandwritingMultiStroke(
   strokes: readonly { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[],
@@ -500,12 +629,11 @@ export async function recognizeHandwritingMultiStroke(
 
   if (strokes.length === 0) { return noResult; }
 
-  // Run BOTH engines in parallel and pick the best result
   const results: HandwritingResult[] = [];
 
   const trOcrPromise = trOcrReady
     ? (async () => {
-        const trCanvas = renderMultiStrokeToCanvas(strokes, strokeWidth, 128);
+        const trCanvas = renderMultiStrokeForTrOCR(strokes, strokeWidth);
         if (trCanvas) {
           const r = await recognizeWithTrOcrWorker(trCanvas);
           if (r.text.length > 0) { results.push(r); }
@@ -514,7 +642,7 @@ export async function recognizeHandwritingMultiStroke(
     : Promise.resolve();
 
   const tessPromise = (async () => {
-    const tessCanvas = renderMultiStrokeToCanvas(strokes, strokeWidth, 400);
+    const tessCanvas = renderMultiStrokeForTesseract(strokes, strokeWidth);
     if (tessCanvas) {
       const r = await recognizeWithTesseract(tessCanvas);
       if (r.text.length > 0) { results.push(r); }
@@ -538,7 +666,6 @@ export async function recognizeHandwritingMultiStroke(
  * TrOCR loads in background — Tesseract is available immediately as fallback.
  */
 export async function preloadHandwritingEngine(): Promise<void> {
-  // Start both in parallel — neither blocks the main thread
   ensureTrOcrWorker().catch(() => {});
   await ensureTesseract().catch(() => {});
 }
