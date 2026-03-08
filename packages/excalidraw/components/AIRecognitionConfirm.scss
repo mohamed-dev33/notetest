@@ -1,0 +1,87 @@
+.ai-recognition-confirm {
+  position: absolute;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--color-surface-high, #fff);
+  border: 1px solid var(--color-border-outline-variant, #d4d4d8);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  font-size: 13px;
+  font-family: var(--ui-font);
+  color: var(--color-on-surface, #1a1a2e);
+  pointer-events: all;
+  animation: ai-confirm-fade-in 0.15s ease-out;
+  transform: translateX(-50%);
+
+  &__content {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  &__icon {
+    font-size: 16px;
+  }
+
+  &__label {
+    white-space: nowrap;
+    strong {
+      color: var(--color-primary, #6965db);
+    }
+  }
+
+  &__confidence {
+    margin-left: 4px;
+    font-size: 11px;
+    color: var(--color-text-secondary, #888);
+  }
+
+  &__actions {
+    display: flex;
+    gap: 4px;
+    margin-left: 4px;
+  }
+
+  &__btn {
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.1s;
+
+    &--accept {
+      background: #22c55e;
+      color: #fff;
+      &:hover {
+        background: #16a34a;
+      }
+    }
+
+    &--reject {
+      background: #ef4444;
+      color: #fff;
+      &:hover {
+        background: #dc2626;
+      }
+    }
+  }
+}
+
+@keyframes ai-confirm-fade-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}

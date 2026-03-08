@@ -655,11 +655,20 @@ export function recognizeShape(
     };
   }
 
-  // Arrow detection — only for strokes that are NOT clearly closed
-  // Arrows are open shapes: start/end points should be separated
-  if (points.length >= 6 && closeness > 0.08) {
+  // Arrow detection — skip for clearly closed shapes (circles, rectangles)
+  // For moderately open shapes, check arrow pattern
+  // For clearly open shapes, always check
+  if (points.length >= 6 && closeness > 0.10) {
     const arrowResult = detectArrow(points, totalLen, elementX, elementY, bounds);
     if (arrowResult) { return arrowResult; }
+  }
+  // Even for nearly-closed shapes, check elongated arrow pattern (V-head curling back)
+  if (points.length >= 6 && closeness <= 0.10) {
+    const elongation = Math.max(bounds.width, bounds.height) / Math.max(Math.min(bounds.width, bounds.height), 1);
+    if (elongation > 2.0) {
+      const arrowResult = detectArrow(points, totalLen, elementX, elementY, bounds);
+      if (arrowResult && arrowResult.confidence > 0.6) { return arrowResult; }
+    }
   }
 
   // Moderately straight open stroke → line
@@ -740,11 +749,14 @@ export function recognizeShape(
   }
 
   // ---- Triangle detection ----
-  // ~3 corners, lower fill ratio (~0.5)
+  // ~3 corners, lower fill ratio (~0.5), NOT elongated (elongated = arrow/line)
+  const elongationRatio = Math.max(bounds.width, bounds.height) / Math.max(Math.min(bounds.width, bounds.height), 1);
   if (
     cornerCount >= 2 && cornerCount <= 4 &&
     fillRatio > 0.20 && fillRatio < 0.68 &&
-    convexity > 0.75
+    convexity > 0.75 &&
+    aspectRatio > 0.35 && aspectRatio < 2.5 &&
+    elongationRatio < 2.5
   ) {
     return {
       type: "triangle",
@@ -812,7 +824,7 @@ export function recognizeShape(
     if (fillRatio > 0.50 && aspectRatio > 0.5 && aspectRatio < 2.0) {
       return { type: "diamond", confidence: fillRatio * closedConf, bounds: makeBounds() };
     }
-    if (fillRatio > 0.20 && cornerCount <= 4) {
+    if (fillRatio > 0.20 && cornerCount <= 4 && elongationRatio < 2.5) {
       return { type: "triangle", confidence: Math.max(0.5, convexity * 0.8) * closedConf, bounds: makeBounds() };
     }
   }

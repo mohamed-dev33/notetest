@@ -205,6 +205,13 @@ export const SelectedShapeActions = ({
         targetElements.some((element) => element.type === "freedraw")) &&
         renderAction("changeStrokeShape")}
 
+      {appState.activeTool.type === "freedraw" && (
+        <>
+          {renderAction("aiShapeRecognition")}
+          {renderAction("aiHandwritingRecognition")}
+        </>
+      )}
+
       {(hasStrokeStyle(appState.activeTool.type) ||
         targetElements.some((element) => hasStrokeStyle(element.type))) && (
         <>

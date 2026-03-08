@@ -46,8 +46,8 @@ function renderPointsToCanvas(
   const rawH = maxY - minY;
   if (rawW < 3 && rawH < 3) { return null; }
 
-  const padding = 32;
-  const scale = Math.max(1.5, targetHeight / Math.max(rawH, 1));
+  const padding = 48;
+  const scale = Math.max(2.0, targetHeight / Math.max(rawH, 1));
   const canvasW = Math.ceil(rawW * scale + padding * 2);
   const canvasH = Math.ceil(rawH * scale + padding * 2);
 
@@ -64,7 +64,7 @@ function renderPointsToCanvas(
 
   // Thick black strokes — thicker = clearer for OCR
   ctx.strokeStyle = "#000000";
-  ctx.lineWidth = Math.max(4, strokeWidth * scale * 1.2);
+  ctx.lineWidth = Math.max(6, strokeWidth * scale * 1.5);
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
@@ -84,6 +84,19 @@ function renderPointsToCanvas(
     }
   }
   ctx.stroke();
+
+  // Binarize: force each pixel to pure black or pure white
+  // Use a gentler threshold to preserve thin strokes
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+    const val = gray < 200 ? 0 : 255;
+    data[i] = val;
+    data[i + 1] = val;
+    data[i + 2] = val;
+  }
+  ctx.putImageData(imgData, 0, 0);
 
   return canvas;
 }
@@ -209,7 +222,7 @@ async function ensureTesseract(): Promise<any> {
       });
       // CRITICAL: Disable dictionary-based word correction
       // This prevents Tesseract from "fixing" handwritten text
-      // (e.g. "youssef" → "you say" or "gogst")
+      // (e.g. "youssef" → "you say" or "brows")
       await tesseractWorker.setParameters({
         tessedit_pageseg_mode: "7",
         preserve_interword_spaces: "1",
@@ -217,6 +230,7 @@ async function ensureTesseract(): Promise<any> {
         load_freq_dawg: "0",
         language_model_penalty_non_dict_word: "0",
         language_model_penalty_non_freq_dict_word: "0",
+        tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,!?'-:;()@#$%&",
       });
       console.log("[AI] Tesseract worker ready (dictionary disabled)");
     } catch (e) {
@@ -364,8 +378,8 @@ function renderMultiStrokeToCanvas(
   const rawH = maxY - minY;
   if (rawW < 3 && rawH < 3) { return null; }
 
-  const padding = 32;
-  const scale = Math.max(1.5, targetHeight / Math.max(rawH, 1));
+  const padding = 48;
+  const scale = Math.max(2.0, targetHeight / Math.max(rawH, 1));
   const canvasW = Math.ceil(rawW * scale + padding * 2);
   const canvasH = Math.ceil(rawH * scale + padding * 2);
 
@@ -380,7 +394,7 @@ function renderMultiStrokeToCanvas(
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   ctx.strokeStyle = "#000000";
-  ctx.lineWidth = Math.max(4, strokeWidth * scale * 1.2);
+  ctx.lineWidth = Math.max(6, strokeWidth * scale * 1.5);
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
@@ -403,6 +417,18 @@ function renderMultiStrokeToCanvas(
     }
     ctx.stroke();
   }
+
+  // Binarize for clean OCR input
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+    const val = gray < 200 ? 0 : 255;
+    data[i] = val;
+    data[i + 1] = val;
+    data[i + 2] = val;
+  }
+  ctx.putImageData(imgData, 0, 0);
 
   return canvas;
 }
@@ -440,9 +466,9 @@ export async function recognizeHandwriting(
       })()
     : Promise.resolve();
 
-  // Tesseract (300px height for traditional OCR)
+  // Tesseract (400px height for traditional OCR — higher res = better accuracy)
   const tessPromise = (async () => {
-    const tessCanvas = renderPointsToCanvas(points, strokeWidth, 300);
+    const tessCanvas = renderPointsToCanvas(points, strokeWidth, 400);
     if (tessCanvas) {
       const r = await recognizeWithTesseract(tessCanvas);
       if (r.text.length > 0) { results.push(r); }
@@ -488,7 +514,7 @@ export async function recognizeHandwritingMultiStroke(
     : Promise.resolve();
 
   const tessPromise = (async () => {
-    const tessCanvas = renderMultiStrokeToCanvas(strokes, strokeWidth, 300);
+    const tessCanvas = renderMultiStrokeToCanvas(strokes, strokeWidth, 400);
     if (tessCanvas) {
       const r = await recognizeWithTesseract(tessCanvas);
       if (r.text.length > 0) { results.push(r); }

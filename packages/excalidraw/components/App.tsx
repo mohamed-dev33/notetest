@@ -440,6 +440,7 @@ import { ContextMenu, CONTEXT_MENU_SEPARATOR } from "./ContextMenu";
 import { activeEyeDropperAtom } from "./EyeDropper";
 import FollowMode from "./FollowMode/FollowMode";
 import LayerUI from "./LayerUI";
+import AIRecognitionConfirm from "./AIRecognitionConfirm";
 import { ElementCanvasButton } from "./MagicButton";
 import { SVGLayer } from "./SVGLayer";
 import { searchItemInFocusAtom } from "./SearchMenu";
@@ -2101,6 +2102,16 @@ class App extends React.Component<AppProps, AppState> {
                         <div className="excalidraw-textEditorContainer" />
                         <div className="excalidraw-contextMenuContainer" />
                         <div className="excalidraw-eye-dropper-container" />
+                        {this.state.aiRecognitionPending && (
+                          <AIRecognitionConfirm
+                            type={this.state.aiRecognitionPending.type}
+                            label={this.state.aiRecognitionPending.label}
+                            confidence={this.state.aiRecognitionPending.confidence}
+                            position={this.state.aiRecognitionPending.position}
+                            onAccept={this.state.aiRecognitionPending.onAccept}
+                            onReject={this.state.aiRecognitionPending.onReject}
+                          />
+                        )}
                         <SVGLayer
                           trails={[
                             this.laserTrails,
@@ -8579,13 +8590,58 @@ class App extends React.Component<AppProps, AppState> {
         return;
       }
 
+      this.setToast({ message: "" });
       const consumed = result.consumedElements ?? elements;
 
-      if (result.type === "shape" && result.shape) {
-        this.applyShapeRecognition(result.shape, consumed);
-      } else if (result.type === "text" && result.handwriting) {
-        this.applyHandwritingRecognition(result.handwriting, consumed);
+      // Compute popup position (center of consumed elements, in screen coords)
+      let gMinX = Infinity, gMinY = Infinity, gMaxX = -Infinity, gMaxY = -Infinity;
+      for (const el of consumed) {
+        gMinX = Math.min(gMinX, el.x);
+        gMinY = Math.min(gMinY, el.y);
+        gMaxX = Math.max(gMaxX, el.x + el.width);
+        gMaxY = Math.max(gMaxY, el.y + el.height);
       }
+      const centerX = (gMinX + gMaxX) / 2;
+      const popupY = gMinY - 10;
+
+      // Convert scene coords to screen coords
+      const { scrollX, scrollY, zoom } = this.state;
+      const screenX = (centerX + scrollX) * zoom.value;
+      const screenY = (popupY + scrollY) * zoom.value;
+
+      const label =
+        result.type === "shape" && result.shape
+          ? result.shape.type
+          : result.type === "text" && result.handwriting
+            ? `"${result.handwriting.text}"`
+            : "";
+
+      const confidence =
+        result.type === "shape" && result.shape
+          ? result.shape.confidence * 100
+          : result.type === "text" && result.handwriting
+            ? result.handwriting.confidence
+            : 0;
+
+      this.setState({
+        aiRecognitionPending: {
+          type: result.type as "shape" | "text",
+          label,
+          confidence,
+          position: { x: screenX, y: screenY },
+          onAccept: () => {
+            if (result.type === "shape" && result.shape) {
+              this.applyShapeRecognition(result.shape, consumed);
+            } else if (result.type === "text" && result.handwriting) {
+              this.applyHandwritingRecognition(result.handwriting, consumed);
+            }
+            this.setState({ aiRecognitionPending: null });
+          },
+          onReject: () => {
+            this.setState({ aiRecognitionPending: null });
+          },
+        },
+      });
     } catch (error) {
       console.error("AI Recognition error:", error);
       this.setToast({ message: "" });

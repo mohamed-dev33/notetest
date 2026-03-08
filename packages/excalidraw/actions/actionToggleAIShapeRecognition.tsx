@@ -24,4 +24,30 @@ export const actionToggleAIShapeRecognition = register({
     };
   },
   checked: (appState) => appState.aiShapeRecognitionEnabled,
+  PanelComponent: ({ appState, updateData }) => (
+    <button
+      className={`ToolIcon_type_checkbox ${appState.aiShapeRecognitionEnabled ? "is-active" : ""}`}
+      onClick={() => updateData(null)}
+      title="AI Shape Recognition"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "4px",
+        padding: "4px 8px",
+        borderRadius: "6px",
+        border: "1px solid var(--default-border-color)",
+        background: appState.aiShapeRecognitionEnabled
+          ? "var(--color-primary)"
+          : "var(--island-bg-color)",
+        color: appState.aiShapeRecognitionEnabled
+          ? "#fff"
+          : "var(--text-primary-color)",
+        cursor: "pointer",
+        fontSize: "12px",
+        whiteSpace: "nowrap",
+      }}
+    >
+      🔷 AI Shape
+    </button>
+  ),
 });

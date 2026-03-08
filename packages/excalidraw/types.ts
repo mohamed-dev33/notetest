@@ -469,6 +469,15 @@ export interface AppState {
   /** AI recognition features */
   aiShapeRecognitionEnabled: boolean;
   aiHandwritingRecognitionEnabled: boolean;
+  /** Pending AI recognition confirmation — shown as inline popup */
+  aiRecognitionPending: {
+    type: "shape" | "text";
+    label: string;
+    confidence: number;
+    position: { x: number; y: number };
+    onAccept: () => void;
+    onReject: () => void;
+  } | null;
 }
 
 export type SearchMatch = {

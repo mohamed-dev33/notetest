@@ -31,4 +31,30 @@ export const actionToggleAIHandwritingRecognition = register({
     };
   },
   checked: (appState) => appState.aiHandwritingRecognitionEnabled,
+  PanelComponent: ({ appState, updateData }) => (
+    <button
+      className={`ToolIcon_type_checkbox ${appState.aiHandwritingRecognitionEnabled ? "is-active" : ""}`}
+      onClick={() => updateData(null)}
+      title="AI Handwriting Recognition"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "4px",
+        padding: "4px 8px",
+        borderRadius: "6px",
+        border: "1px solid var(--default-border-color)",
+        background: appState.aiHandwritingRecognitionEnabled
+          ? "var(--color-primary)"
+          : "var(--island-bg-color)",
+        color: appState.aiHandwritingRecognitionEnabled
+          ? "#fff"
+          : "var(--text-primary-color)",
+        cursor: "pointer",
+        fontSize: "12px",
+        whiteSpace: "nowrap",
+      }}
+    >
+      ✍️ AI Text
+    </button>
+  ),
 });
