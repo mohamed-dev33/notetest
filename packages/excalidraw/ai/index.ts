@@ -120,8 +120,12 @@ export async function processFreedrawElement(
 
 /**
  * Process a batch of freedraw elements drawn in quick succession.
- * Tries multi-stroke handwriting recognition first, then falls back
- * to individual shape recognition.
+ *
+ * Strategy:
+ * 1. Combine all strokes' points into one path and try shape recognition
+ *    (handles multi-stroke shapes like arrow = line + head)
+ * 2. Try multi-stroke handwriting recognition
+ * 3. Fall back to single-element shape recognition on each element
  */
 export async function processFreedrawBatch(
   elements: ExcalidrawFreeDrawElement[],
@@ -143,8 +147,46 @@ export async function processFreedrawBatch(
     );
   }
 
-  // Multiple strokes — likely handwriting (multi-stroke letters/words)
-  // Try combined handwriting recognition first
+  // --- Multi-stroke shape recognition ---
+  // Combine all strokes into a single point sequence (preserving global coords)
+  // so Protractor can recognize multi-stroke shapes (e.g. arrow = line + head)
+  if (shapeRecognitionEnabled) {
+    const combinedPoints: LocalPoint[] = [];
+    let globalMinX = Infinity, globalMinY = Infinity;
+
+    // Compute global min to use as reference origin
+    for (const el of elements) {
+      for (const p of el.points as readonly LocalPoint[]) {
+        globalMinX = Math.min(globalMinX, el.x + p[0]);
+        globalMinY = Math.min(globalMinY, el.y + p[1]);
+      }
+    }
+
+    // Combine all points into one sequence, translated to local coords
+    for (const el of elements) {
+      for (const p of el.points as readonly LocalPoint[]) {
+        combinedPoints.push(
+          [p[0] + el.x - globalMinX, p[1] + el.y - globalMinY] as LocalPoint,
+        );
+      }
+    }
+
+    if (combinedPoints.length >= 5) {
+      const shapeResult = recognizeShape(combinedPoints, globalMinX, globalMinY);
+      if (
+        shapeResult.type !== "freedraw" &&
+        shapeResult.confidence >= SHAPE_CONFIDENCE_THRESHOLD
+      ) {
+        return {
+          type: "shape",
+          shape: shapeResult,
+          consumedElements: elements,
+        };
+      }
+    }
+  }
+
+  // --- Multi-stroke handwriting recognition ---
   if (handwritingRecognitionEnabled) {
     const allStrokes: { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[] = [];
     for (const el of elements) {
@@ -177,22 +219,22 @@ export async function processFreedrawBatch(
     }
   }
 
-  // Multi-stroke didn't match as text — try individual shape recognition
-  // on the last element (most likely the completed shape)
+  // --- Fallback: try each element individually for shape ---
   if (shapeRecognitionEnabled) {
-    const lastEl = elements[elements.length - 1];
-    const points = lastEl.points as readonly LocalPoint[];
-    if (points.length >= 5) {
-      const shapeResult = recognizeShape(points, lastEl.x, lastEl.y);
-      if (
-        shapeResult.type !== "freedraw" &&
-        shapeResult.confidence >= SHAPE_CONFIDENCE_THRESHOLD
-      ) {
-        return {
-          type: "shape",
-          shape: shapeResult,
-          consumedElements: [lastEl],
-        };
+    for (const el of elements) {
+      const points = el.points as readonly LocalPoint[];
+      if (points.length >= 5) {
+        const shapeResult = recognizeShape(points, el.x, el.y);
+        if (
+          shapeResult.type !== "freedraw" &&
+          shapeResult.confidence >= SHAPE_CONFIDENCE_THRESHOLD
+        ) {
+          return {
+            type: "shape",
+            shape: shapeResult,
+            consumedElements: [el],
+          };
+        }
       }
     }
   }

@@ -1,13 +1,11 @@
 /**
- * Handwriting Recognition Module — TrOCR + Tesseract.js
+ * Handwriting Recognition Module — Tesseract.js (Web Worker)
  *
- * Uses Microsoft TrOCR (via @xenova/transformers / ONNX Runtime Web) as
- * the primary handwriting recognizer. Falls back to Tesseract.js if
- * TrOCR fails or is unavailable. Both run entirely in the browser.
+ * Uses Tesseract.js which runs OCR entirely in a Web Worker, keeping
+ * the main thread free and responsive. No UI freezing.
  *
- * TrOCR is a transformer-based model specifically trained on handwritten
- * text (IAM dataset) — far more accurate than traditional OCR for
- * freehand writing.
+ * TrOCR was removed because it runs ONNX inference on the main thread,
+ * causing the entire UI to freeze during recognition.
  */
 
 import type { LocalPoint } from "@excalidraw/math";
@@ -105,100 +103,7 @@ function renderForTesseract(
 }
 
 // =====================================================================
-// TrOCR Engine (Primary — State of the Art)
-// =====================================================================
-
-let trOcrPipeline: any = null;
-let trOcrLoading = false;
-let trOcrLoadPromise: Promise<any> | null = null;
-let trOcrAvailable: boolean | null = null; // null = not yet checked
-
-async function ensureTrOcr(): Promise<any> {
-  if (trOcrPipeline) { return trOcrPipeline; }
-  if (trOcrAvailable === false) { return null; }
-
-  if (trOcrLoading && trOcrLoadPromise) {
-    await trOcrLoadPromise;
-    return trOcrPipeline;
-  }
-
-  trOcrLoading = true;
-  trOcrLoadPromise = (async () => {
-    try {
-      const { pipeline, env } = await import("@xenova/transformers");
-      // Configure environment for browser usage
-      env.allowLocalModels = false;
-      env.useBrowserCache = true;
-      // Ensure remote model fetching is enabled
-      env.allowRemoteModels = true;
-      // Use CDN for ONNX wasm files
-      if (env.backends?.onnx?.wasm) {
-        env.backends.onnx.wasm.numThreads = 1;
-      }
-      console.log("[AI] Loading TrOCR model from HuggingFace...");
-      // Load the small TrOCR model for handwritten text
-      trOcrPipeline = await pipeline(
-        "image-to-text",
-        "Xenova/trocr-small-handwritten",
-        {
-          quantized: true,
-        },
-      );
-      trOcrAvailable = true;
-      console.log("[AI] TrOCR handwriting model loaded successfully");
-    } catch (e) {
-      console.warn("[AI] TrOCR not available, will use Tesseract fallback:", e);
-      trOcrAvailable = false;
-      trOcrPipeline = null;
-    }
-  })();
-
-  await trOcrLoadPromise;
-  trOcrLoading = false;
-  return trOcrPipeline;
-}
-
-async function recognizeWithTrOcr(
-  canvas: HTMLCanvasElement,
-): Promise<HandwritingResult> {
-  const noResult: HandwritingResult = { text: "", confidence: 0 };
-
-  try {
-    const pipe = await ensureTrOcr();
-    if (!pipe) { return noResult; }
-
-    // Convert canvas to blob URL for the pipeline
-    const blob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, "image/png"),
-    );
-    if (!blob) { return noResult; }
-
-    const url = URL.createObjectURL(blob);
-
-    try {
-      const results = await pipe(url);
-      if (results && results.length > 0) {
-        const text = (results[0].generated_text || "").trim();
-        if (text.length > 0) {
-          // TrOCR doesn't return confidence directly;
-          // estimate based on text quality heuristics
-          const hasAlphanumeric = /[a-zA-Z0-9]/.test(text);
-          const confidence = hasAlphanumeric ? 85 : 40;
-          return { text, confidence };
-        }
-      }
-    } finally {
-      URL.revokeObjectURL(url);
-    }
-  } catch (e) {
-    console.warn("[AI] TrOCR recognition error:", e);
-  }
-
-  return noResult;
-}
-
-// =====================================================================
-// Tesseract.js Engine (Fallback)
+// Tesseract.js Engine (Web Worker — non-blocking)
 // =====================================================================
 
 let tesseractWorker: any = null;
@@ -400,7 +305,7 @@ function renderMultiStrokeToCanvas(
 
 /**
  * Recognize handwritten text from freedraw points (single stroke).
- * Uses TrOCR (primary) with Tesseract.js (fallback).
+ * Uses Tesseract.js running in a Web Worker (non-blocking).
  */
 export async function recognizeHandwriting(
   points: readonly LocalPoint[],
@@ -413,16 +318,6 @@ export async function recognizeHandwriting(
     return noResult;
   }
 
-  // Try TrOCR first
-  const trOcrCanvas = renderPointsToCanvas(points, strokeWidth, 64);
-  if (trOcrCanvas) {
-    const trOcrResult = await recognizeWithTrOcr(trOcrCanvas);
-    if (trOcrResult.text.length > 0 && trOcrResult.confidence >= 40) {
-      return trOcrResult;
-    }
-  }
-
-  // Fallback to Tesseract.js
   const tessCanvas = renderForTesseract(points, strokeWidth);
   if (tessCanvas) {
     const tessResult = await recognizeWithTesseract(tessCanvas);
@@ -437,7 +332,7 @@ export async function recognizeHandwriting(
 /**
  * Recognize handwritten text from multiple strokes combined.
  * All strokes are rendered onto a single canvas preserving
- * their spatial positions, then fed to OCR.
+ * their spatial positions, then fed to Tesseract OCR (Web Worker).
  */
 export async function recognizeHandwritingMultiStroke(
   strokes: readonly { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[],
@@ -447,16 +342,6 @@ export async function recognizeHandwritingMultiStroke(
 
   if (strokes.length === 0) { return noResult; }
 
-  // TrOCR with combined canvas
-  const trOcrCanvas = renderMultiStrokeToCanvas(strokes, strokeWidth, 64);
-  if (trOcrCanvas) {
-    const trOcrResult = await recognizeWithTrOcr(trOcrCanvas);
-    if (trOcrResult.text.length > 0 && trOcrResult.confidence >= 40) {
-      return trOcrResult;
-    }
-  }
-
-  // Tesseract fallback with larger canvas
   const tessCanvas = renderMultiStrokeToCanvas(strokes, strokeWidth, 200);
   if (tessCanvas) {
     const tessResult = await recognizeWithTesseract(tessCanvas);
@@ -469,25 +354,18 @@ export async function recognizeHandwritingMultiStroke(
 }
 
 /**
- * Pre-initialize engines (call when handwriting recognition is enabled)
+ * Pre-initialize Tesseract engine (call when handwriting recognition is enabled)
  */
 export async function preloadHandwritingEngine(): Promise<void> {
-  // Start loading both engines in parallel
-  const promises: Promise<any>[] = [];
-  promises.push(ensureTrOcr().catch(() => {}));
-  promises.push(ensureTesseract().catch(() => {}));
-  await Promise.all(promises);
+  await ensureTesseract().catch(() => {});
 }
 
 /**
- * Terminate engines when no longer needed
+ * Terminate engine when no longer needed
  */
 export async function terminateHandwritingEngine(): Promise<void> {
   if (tesseractWorker) {
     try { await tesseractWorker.terminate(); } catch { /* ignore */ }
     tesseractWorker = null;
   }
-  // TrOCR pipeline doesn't need explicit termination
-  trOcrPipeline = null;
-  trOcrAvailable = null;
 }
