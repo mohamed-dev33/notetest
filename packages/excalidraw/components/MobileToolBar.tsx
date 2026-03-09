@@ -261,42 +261,21 @@ export const MobileToolBar = ({
         onChange={() => handleToolChange("eraser")}
       />
 
-      {/* AI toggles — visible when freedraw is active */}
+      {/* AI toggle — visible when freedraw is active */}
       {activeTool.type === "freedraw" && (
-        <>
-          <ToolButton
-            type="icon"
-            icon={<span style={{ fontSize: 14 }}>🔷</span>}
-            title="AI Shape"
-            aria-label="AI Shape Recognition"
-            selected={app.state.aiShapeRecognitionEnabled}
-            data-testid="toolbar-ai-shape"
-            onClick={() => {
-              setAppState((s: any) => ({
-                aiShapeRecognitionEnabled: !s.aiShapeRecognitionEnabled,
-              }));
-            }}
-          />
-          <ToolButton
-            type="icon"
-            icon={<span style={{ fontSize: 14 }}>✍️</span>}
-            title="AI Text"
-            aria-label="AI Handwriting Recognition"
-            selected={app.state.aiHandwritingRecognitionEnabled}
-            data-testid="toolbar-ai-handwriting"
-            onClick={() => {
-              setAppState((s: any) => ({
-                aiHandwritingRecognitionEnabled:
-                  !s.aiHandwritingRecognitionEnabled,
-              }));
-              if (!app.state.aiHandwritingRecognitionEnabled) {
-                import("../ai").then(({ preloadHandwritingEngine }) =>
-                  preloadHandwritingEngine(),
-                );
-              }
-            }}
-          />
-        </>
+        <ToolButton
+          type="icon"
+          icon={<span style={{ fontSize: 14 }}>🔷</span>}
+          title="AI Shape"
+          aria-label="AI Shape Recognition"
+          selected={app.state.aiShapeRecognitionEnabled}
+          data-testid="toolbar-ai-shape"
+          onClick={() => {
+            setAppState((s: any) => ({
+              aiShapeRecognitionEnabled: !s.aiShapeRecognitionEnabled,
+            }));
+          }}
+        />
       )}
 
       {/* Rectangle */}

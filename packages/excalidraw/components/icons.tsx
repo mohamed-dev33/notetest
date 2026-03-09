@@ -2444,15 +2444,3 @@ export const shapeRecognitionIcon = createIcon(
   </g>,
   tablerIconProps,
 );
-
-// AI Handwriting Recognition icon (tabler-icons: writing)
-export const handwritingRecognitionIcon = createIcon(
-  <g strokeWidth={1.25}>
-    <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-    <path d="M20 17v-12c0 -1.121 -.879 -2 -2 -2s-2 .879 -2 2v12l2 2l2 -2z" />
-    <path d="M16 7h4" />
-    <path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" />
-    <path d="M13.5 6.5l4 4" />
-  </g>,
-  tablerIconProps,
-);

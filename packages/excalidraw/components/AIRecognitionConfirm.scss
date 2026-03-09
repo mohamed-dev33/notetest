@@ -65,6 +65,17 @@
       }
     }
 
+    &--alt {
+      background: var(--color-surface-mid, #e8e8ee);
+      color: var(--color-on-surface, #1a1a2e);
+      font-size: 16px;
+      border: 1px solid var(--color-border-outline-variant, #d4d4d8);
+      &:hover {
+        background: var(--color-primary-light, #c4c3f5);
+        border-color: var(--color-primary, #6965db);
+      }
+    }
+
     &--reject {
       background: #ef4444;
       color: #fff;

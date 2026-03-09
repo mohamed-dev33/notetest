@@ -129,8 +129,6 @@ export const getDefaultAppState = (): Omit<
     activeLockedId: null,
     bindMode: "orbit",
     aiShapeRecognitionEnabled: false,
-    aiHandwritingRecognitionEnabled: false,
-    aiArabicHandwritingEnabled: false,
     aiAutoSelectAfterRecognize: true,
     aiRecognitionPending: null,
   };
@@ -260,8 +258,6 @@ const APP_STATE_STORAGE_CONF = (<
   activeLockedId: { browser: false, export: false, server: false },
   bindMode: { browser: true, export: false, server: false },
   aiShapeRecognitionEnabled: { browser: true, export: false, server: false },
-  aiHandwritingRecognitionEnabled: { browser: true, export: false, server: false },
-  aiArabicHandwritingEnabled: { browser: true, export: false, server: false },
   aiAutoSelectAfterRecognize: { browser: true, export: false, server: false },
   aiRecognitionPending: { browser: false, export: false, server: false },
 });

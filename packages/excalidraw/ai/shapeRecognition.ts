@@ -46,9 +46,14 @@ interface Point {
 const NUM_POINTS = 64; // resample to this many points
 const ORIGIN: Point = { x: 0, y: 0 };
 
+/** Squared distance (avoids sqrt for comparisons) */
+function distSq(a: Point, b: Point): number {
+  return (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
+}
+
 /** Euclidean distance between two points */
 function dist(a: Point, b: Point): number {
-  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+  return Math.sqrt(distSq(a, b));
 }
 
 /** Total path length of a polyline */
@@ -102,26 +107,26 @@ function centroid(pts: Point[]): Point {
 }
 
 /** Translate so centroid is at origin */
-function translateTo(pts: Point[], target: Point): Point[] {
-  const c = centroid(pts);
-  return pts.map((p) => ({ x: p.x + target.x - c.x, y: p.y + target.y - c.y }));
+function translateTo(pts: Point[], target: Point, c?: Point): Point[] {
+  const ct = c ?? centroid(pts);
+  return pts.map((p) => ({ x: p.x + target.x - ct.x, y: p.y + target.y - ct.y }));
 }
 
 /** Compute indicative angle (angle from centroid to first point) */
-function indicativeAngle(pts: Point[]): number {
-  const c = centroid(pts);
-  return Math.atan2(c.y - pts[0].y, c.x - pts[0].x);
+function indicativeAngle(pts: Point[], c?: Point): number {
+  const ct = c ?? centroid(pts);
+  return Math.atan2(ct.y - pts[0].y, ct.x - pts[0].x);
 }
 
 /** Rotate points by angle around centroid */
-function rotateBy(pts: Point[], radians: number): Point[] {
-  const c = centroid(pts);
+function rotateBy(pts: Point[], radians: number, c?: Point): Point[] {
+  const ct = c ?? centroid(pts);
   const cos = Math.cos(radians);
   const sin = Math.sin(radians);
   return pts.map((p) => {
-    const dx = p.x - c.x;
-    const dy = p.y - c.y;
-    return { x: dx * cos - dy * sin + c.x, y: dx * sin + dy * cos + c.y };
+    const dx = p.x - ct.x;
+    const dy = p.y - ct.y;
+    return { x: dx * cos - dy * sin + ct.x, y: dx * sin + dy * cos + ct.y };
   });
 }
 
@@ -130,7 +135,8 @@ function rotateBy(pts: Point[], radians: number): Point[] {
  * translated points. This is the Protractor representation.
  */
 function vectorize(pts: Point[], orientationSensitive: boolean): number[] {
-  const iAngle = indicativeAngle(pts);
+  const c = centroid(pts);
+  const iAngle = indicativeAngle(pts, c);
   let delta = 0;
 
   if (orientationSensitive) {
@@ -140,8 +146,6 @@ function vectorize(pts: Point[], orientationSensitive: boolean): number[] {
     delta = -iAngle;
   }
 
-  // Compute centroid ONCE (was O(n²) bug — called inside loop before)
-  const c = centroid(pts);
   const cos = Math.cos(delta);
   const sin = Math.sin(delta);
 
@@ -473,6 +477,7 @@ function detectCorners(pts: Point[], angleThrDeg: number = 30): number[] {
 
   const windowSize = Math.max(3, Math.floor(pts.length / 20));
   const cornerCandidates: { idx: number; angle: number }[] = [];
+  const minMagSq = 0.000001; // 0.001²
 
   for (let i = windowSize; i < pts.length - windowSize; i++) {
     const prev = pts[i - windowSize];
@@ -484,12 +489,13 @@ function detectCorners(pts: Point[], angleThrDeg: number = 30): number[] {
     const v2x = next.x - curr.x;
     const v2y = next.y - curr.y;
 
-    const mag1 = Math.sqrt(v1x * v1x + v1y * v1y);
-    const mag2 = Math.sqrt(v2x * v2x + v2y * v2y);
-    if (mag1 < 0.001 || mag2 < 0.001) { continue; }
+    const magSq1 = v1x * v1x + v1y * v1y;
+    const magSq2 = v2x * v2x + v2y * v2y;
+    if (magSq1 < minMagSq || magSq2 < minMagSq) { continue; }
 
     const dot = v1x * v2x + v1y * v2y;
-    const cosAngle = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
+    // Combined sqrt: sqrt(a)*sqrt(b) = sqrt(a*b)
+    const cosAngle = Math.max(-1, Math.min(1, dot / Math.sqrt(magSq1 * magSq2)));
     const angleDeg = Math.acos(cosAngle) * 180 / Math.PI;
 
     if (angleDeg < (180 - angleThrDeg)) {
@@ -504,7 +510,6 @@ function detectCorners(pts: Point[], angleThrDeg: number = 30): number[] {
     if (filtered.length === 0 || candidate.idx - filtered[filtered.length - 1].idx >= minDist) {
       filtered.push(candidate);
     } else {
-      // Keep the sharper (smaller angle) corner
       const prev = filtered[filtered.length - 1];
       if (candidate.angle < prev.angle) {
         filtered[filtered.length - 1] = candidate;
@@ -516,31 +521,42 @@ function detectCorners(pts: Point[], angleThrDeg: number = 30): number[] {
 }
 
 /**
- * Ramer-Douglas-Peucker simplification — reduces points to key vertices.
+ * Ramer-Douglas-Peucker simplification — iterative (no .slice() allocations).
  */
 function rdpSimplify(pts: Point[], epsilon: number): Point[] {
   if (pts.length <= 2) { return [...pts]; }
 
-  let maxDist = 0;
-  let maxIdx = 0;
-  const first = pts[0];
-  const last = pts[pts.length - 1];
+  // Use a stack-based iterative approach to avoid O(n) slice per recursion
+  const keep = new Uint8Array(pts.length);
+  keep[0] = 1;
+  keep[pts.length - 1] = 1;
 
-  for (let i = 1; i < pts.length - 1; i++) {
-    const d = pointToLineDistance(pts[i], first, last);
-    if (d > maxDist) {
-      maxDist = d;
-      maxIdx = i;
+  const stack: [number, number][] = [[0, pts.length - 1]];
+  while (stack.length > 0) {
+    const [start, end] = stack.pop()!;
+    let maxDist = 0;
+    let maxIdx = start;
+
+    for (let i = start + 1; i < end; i++) {
+      const d = pointToLineDistance(pts[i], pts[start], pts[end]);
+      if (d > maxDist) {
+        maxDist = d;
+        maxIdx = i;
+      }
+    }
+
+    if (maxDist > epsilon) {
+      keep[maxIdx] = 1;
+      if (maxIdx - start > 1) { stack.push([start, maxIdx]); }
+      if (end - maxIdx > 1) { stack.push([maxIdx, end]); }
     }
   }
 
-  if (maxDist > epsilon) {
-    const left = rdpSimplify(pts.slice(0, maxIdx + 1), epsilon);
-    const right = rdpSimplify(pts.slice(maxIdx), epsilon);
-    return [...left.slice(0, -1), ...right];
+  const result: Point[] = [];
+  for (let i = 0; i < pts.length; i++) {
+    if (keep[i]) { result.push(pts[i]); }
   }
-
-  return [first, last];
+  return result;
 }
 
 function pointToLineDistance(p: Point, a: Point, b: Point): number {
@@ -549,7 +565,9 @@ function pointToLineDistance(p: Point, a: Point, b: Point): number {
   const lenSq = dx * dx + dy * dy;
   if (lenSq === 0) { return dist(p, a); }
   const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq));
-  return dist(p, { x: a.x + t * dx, y: a.y + t * dy });
+  const px = a.x + t * dx - p.x;
+  const py = a.y + t * dy - p.y;
+  return Math.sqrt(px * px + py * py);
 }
 
 /**
@@ -578,7 +596,10 @@ function convexHull(pts: Point[]): Point[] {
     upper.push(sorted[i]);
   }
 
-  return [...lower.slice(0, -1), ...upper.slice(0, -1)];
+  // Avoid spread+slice: concat in-place
+  lower.length--; // remove last (same as first of upper)
+  upper.length--; // remove last (same as first of lower)
+  return lower.concat(upper);
 }
 
 // =====================================================================
@@ -601,34 +622,34 @@ function measureCornerAngle(pts: Point[], cornerIdx: number, windowSize: number)
   const v1y = prev.y - curr.y;
   const v2x = next.x - curr.x;
   const v2y = next.y - curr.y;
-  const mag1 = Math.sqrt(v1x * v1x + v1y * v1y);
-  const mag2 = Math.sqrt(v2x * v2x + v2y * v2y);
-  if (mag1 < 0.001 || mag2 < 0.001) { return 180; }
+  const magSq1 = v1x * v1x + v1y * v1y;
+  const magSq2 = v2x * v2x + v2y * v2y;
+  if (magSq1 < 0.000001 || magSq2 < 0.000001) { return 180; }
   const dot = v1x * v2x + v1y * v2y;
-  const cosAngle = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
+  const cosAngle = Math.max(-1, Math.min(1, dot / Math.sqrt(magSq1 * magSq2)));
   return Math.acos(cosAngle) * 180 / Math.PI;
 }
 
 /**
  * Compute average curvature along the path.
- * High curvature = lots of turning, low curvature = straight or smooth.
+ * Uses squared lengths to avoid sqrt in inner loop.
  */
 function averageCurvature(pts: Point[]): number {
   if (pts.length < 3) { return 0; }
   let totalAngle = 0;
   let count = 0;
   const step = Math.max(1, Math.floor(pts.length / 40));
+  const minLenSq = 0.25; // 0.5²
   for (let i = step; i < pts.length - step; i += step) {
     const dx1 = pts[i].x - pts[i - step].x;
     const dy1 = pts[i].y - pts[i - step].y;
     const dx2 = pts[i + step].x - pts[i].x;
     const dy2 = pts[i + step].y - pts[i].y;
-    const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
-    const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
-    if (len1 < 0.5 || len2 < 0.5) { continue; }
-    const dot = (dx1 * dx2 + dy1 * dy2) / (len1 * len2);
-    const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
-    totalAngle += angle;
+    const lenSq1 = dx1 * dx1 + dy1 * dy1;
+    const lenSq2 = dx2 * dx2 + dy2 * dy2;
+    if (lenSq1 < minLenSq || lenSq2 < minLenSq) { continue; }
+    const dot = (dx1 * dx2 + dy1 * dy2) / Math.sqrt(lenSq1 * lenSq2);
+    totalAngle += Math.acos(Math.max(-1, Math.min(1, dot)));
     count++;
   }
   return count > 0 ? totalAngle / count : 0;
@@ -652,21 +673,22 @@ function rightAngleFraction(pts: Point[], cornerIndices: number[]): number {
 
 /**
  * Check if the stroke has consistent curvature (circle-like)
- * vs sharp changes (polygon-like).
+ * vs sharp changes (polygon-like). Uses squared lengths.
  */
 function curvatureVariance(pts: Point[]): number {
   if (pts.length < 6) { return 0; }
   const curvatures: number[] = [];
   const step = Math.max(1, Math.floor(pts.length / 30));
+  const minLenSq = 0.25; // 0.5²
   for (let i = step; i < pts.length - step; i += step) {
     const dx1 = pts[i].x - pts[i - step].x;
     const dy1 = pts[i].y - pts[i - step].y;
     const dx2 = pts[i + step].x - pts[i].x;
     const dy2 = pts[i + step].y - pts[i].y;
-    const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
-    const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
-    if (len1 < 0.5 || len2 < 0.5) { continue; }
-    const dot = (dx1 * dx2 + dy1 * dy2) / (len1 * len2);
+    const lenSq1 = dx1 * dx1 + dy1 * dy1;
+    const lenSq2 = dx2 * dx2 + dy2 * dy2;
+    if (lenSq1 < minLenSq || lenSq2 < minLenSq) { continue; }
+    const dot = (dx1 * dx2 + dy1 * dy2) / Math.sqrt(lenSq1 * lenSq2);
     curvatures.push(Math.acos(Math.max(-1, Math.min(1, dot))));
   }
   if (curvatures.length < 2) { return 0; }
@@ -686,14 +708,45 @@ function perimeterDiameterRatio(pts: Point[], bounds: { width: number; height: n
 }
 
 /**
+ * Pre-process raw stroke: remove duplicate points, smooth pen jitter.
+ * Pen input produces more noise than mouse — this reduces false corners.
+ */
+function preprocessStroke(pts: Point[]): Point[] {
+  if (pts.length < 3) { return [...pts]; }
+
+  // Remove duplicate/near-duplicate consecutive points (pen pressure stutters)
+  const deduped: Point[] = [pts[0]];
+  const minDistSq = 1.0; // 1px² threshold
+  for (let i = 1; i < pts.length; i++) {
+    if (distSq(pts[i], deduped[deduped.length - 1]) >= minDistSq) {
+      deduped.push(pts[i]);
+    }
+  }
+  if (deduped.length < 3) { return deduped; }
+
+  // Light Gaussian-like smoothing (3-point weighted average) to reduce pen jitter
+  // Preserves start/end points and overall shape, but reduces micro-wobble
+  const smoothed: Point[] = [deduped[0]];
+  for (let i = 1; i < deduped.length - 1; i++) {
+    smoothed.push({
+      x: deduped[i - 1].x * 0.2 + deduped[i].x * 0.6 + deduped[i + 1].x * 0.2,
+      y: deduped[i - 1].y * 0.2 + deduped[i].y * 0.6 + deduped[i + 1].y * 0.2,
+    });
+  }
+  smoothed.push(deduped[deduped.length - 1]);
+  return smoothed;
+}
+
+/**
  * Classify detected corners as near bounding-box corners (rectangle-like)
  * vs near bounding-box edge midpoints (diamond-like).
  *
  * Returns a score from -1 (strongly diamond) to +1 (strongly rectangle).
  * 0 = ambiguous.
  *
- * Rectangle corners cluster at (0,0),(1,0),(1,1),(0,1) in normalized bbox.
- * Diamond corners cluster at (0.5,0),(1,0.5),(0.5,1),(0,0.5) in normalized bbox.
+ * Uses squared distances to avoid sqrt. Also considers the distribution
+ * pattern: rectangles have 4 corners in 4 quadrants of the bbox, while
+ * diamonds have corners at N/S/E/W midpoints.
  */
 function cornerPositionScore(
   pts: Point[],
@@ -704,40 +757,66 @@ function cornerPositionScore(
     return 0;
   }
 
-  // Normalize corner positions to [0,1] within bounding box
   let rectScore = 0;
   let diamondScore = 0;
 
+  // Track which quadrants/midpoints are covered
+  let rectQuadrants = 0; // bits: TL=1, TR=2, BR=4, BL=8
+  let diamondMids = 0;   // bits: T=1, R=2, B=4, L=8
+
   for (const ci of cornerIndices) {
-    const nx = (pts[ci].x - bounds.x) / bounds.width; // 0..1
+    const nx = (pts[ci].x - bounds.x) / bounds.width;  // 0..1
     const ny = (pts[ci].y - bounds.y) / bounds.height;
 
-    // Distance to nearest bbox corner (rectangle pattern)
-    const dCorner = Math.min(
-      Math.sqrt(nx * nx + ny * ny), // top-left
-      Math.sqrt((1 - nx) * (1 - nx) + ny * ny), // top-right
-      Math.sqrt((1 - nx) * (1 - nx) + (1 - ny) * (1 - ny)), // bottom-right
-      Math.sqrt(nx * nx + (1 - ny) * (1 - ny)), // bottom-left
+    // Squared distance to nearest bbox corner (rectangle pattern)
+    const dCornerSq = Math.min(
+      nx * nx + ny * ny,                            // top-left
+      (1 - nx) * (1 - nx) + ny * ny,                // top-right
+      (1 - nx) * (1 - nx) + (1 - ny) * (1 - ny),   // bottom-right
+      nx * nx + (1 - ny) * (1 - ny),                // bottom-left
     );
 
-    // Distance to nearest bbox edge midpoint (diamond pattern)
-    const dMid = Math.min(
-      Math.sqrt((0.5 - nx) * (0.5 - nx) + ny * ny), // top-mid
-      Math.sqrt((1 - nx) * (1 - nx) + (0.5 - ny) * (0.5 - ny)), // right-mid
-      Math.sqrt((0.5 - nx) * (0.5 - nx) + (1 - ny) * (1 - ny)), // bottom-mid
-      Math.sqrt(nx * nx + (0.5 - ny) * (0.5 - ny)), // left-mid
+    // Squared distance to nearest bbox edge midpoint (diamond pattern)
+    const dMidSq = Math.min(
+      (0.5 - nx) * (0.5 - nx) + ny * ny,                // top-mid
+      (1 - nx) * (1 - nx) + (0.5 - ny) * (0.5 - ny),   // right-mid
+      (0.5 - nx) * (0.5 - nx) + (1 - ny) * (1 - ny),   // bottom-mid
+      nx * nx + (0.5 - ny) * (0.5 - ny),                // left-mid
     );
 
-    if (dCorner < dMid) {
-      rectScore += (dMid - dCorner);
+    if (dCornerSq < dMidSq) {
+      rectScore += Math.sqrt(dMidSq) - Math.sqrt(dCornerSq);
+      // Track which quadrant
+      if (nx < 0.5 && ny < 0.5) { rectQuadrants |= 1; }
+      if (nx >= 0.5 && ny < 0.5) { rectQuadrants |= 2; }
+      if (nx >= 0.5 && ny >= 0.5) { rectQuadrants |= 4; }
+      if (nx < 0.5 && ny >= 0.5) { rectQuadrants |= 8; }
     } else {
-      diamondScore += (dCorner - dMid);
+      diamondScore += Math.sqrt(dCornerSq) - Math.sqrt(dMidSq);
+      // Track which midpoint
+      if (ny < 0.3) { diamondMids |= 1; }  // top
+      if (nx > 0.7) { diamondMids |= 2; }  // right
+      if (ny > 0.7) { diamondMids |= 4; }  // bottom
+      if (nx < 0.3) { diamondMids |= 8; }  // left
     }
   }
+
+  // Bonus for having corners in all 4 quadrants (strong rectangle signal)
+  const rectCoverage = popcount(rectQuadrants) / 4;
+  const diamondCoverage = popcount(diamondMids) / 4;
+  rectScore += rectCoverage * 0.3;
+  diamondScore += diamondCoverage * 0.3;
 
   const total = rectScore + diamondScore;
   if (total < 0.001) { return 0; }
   return (rectScore - diamondScore) / total; // -1..+1
+}
+
+/** Count set bits (popcount) */
+function popcount(n: number): number {
+  let count = 0;
+  while (n) { count += n & 1; n >>= 1; }
+  return count;
 }
 
 /**
@@ -761,7 +840,14 @@ export function recognizeShape(
     return fallback;
   }
 
-  const points: Point[] = rawPoints.map((p) => ({ x: p[0], y: p[1] }));
+  // Preprocess: remove duplicates and smooth pen jitter
+  const rawPts: Point[] = rawPoints.map((p) => ({ x: p[0], y: p[1] }));
+  const points = preprocessStroke(rawPts);
+
+  if (points.length < MIN_POINTS) {
+    return fallback;
+  }
+
   const bounds = getBounds(points);
 
   if (bounds.width < MIN_STROKE_SIZE && bounds.height < MIN_STROKE_SIZE) {
@@ -1049,6 +1135,224 @@ export function recognizeShape(
 }
 
 /**
+ * Recognize top-N shape candidates from freedraw points.
+ * Returns up to `maxResults` candidates ranked by confidence.
+ * Used for showing suggestions UI so user can pick the right shape.
+ */
+export function recognizeShapeTopN(
+  rawPoints: readonly LocalPoint[],
+  elementX: number,
+  elementY: number,
+  maxResults: number = 3,
+): RecognizedShape[] {
+  // First get the primary result
+  const primary = recognizeShape(rawPoints, elementX, elementY);
+
+  // For lines/arrows/freedraw, just return the single result
+  if (primary.type === "line" || primary.type === "arrow" || primary.type === "freedraw") {
+    return primary.type === "freedraw" ? [] : [primary];
+  }
+
+  if (rawPoints.length < MIN_POINTS) {
+    return [];
+  }
+
+  const points: Point[] = rawPoints.map((p) => ({ x: p[0], y: p[1] }));
+  const smoothed = preprocessStroke(points);
+  const pts = smoothed.length >= MIN_POINTS ? smoothed : points;
+  const bounds = getBounds(pts);
+
+  if (bounds.width < MIN_STROKE_SIZE && bounds.height < MIN_STROKE_SIZE) {
+    return [];
+  }
+
+  const totalLen = pathLength(pts);
+  const closeDist = dist(pts[0], pts[pts.length - 1]);
+  const closeness = totalLen > 0 ? closeDist / totalLen : 1;
+  const effectivelyClosed = closeness < 0.20;
+
+  const makeBounds = () => ({
+    x: elementX + bounds.x,
+    y: elementY + bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+  });
+
+  // Compute geometric features
+  const analyzePoints = effectivelyClosed ? pts : [...pts, { ...pts[0] }];
+  const area = shoelaceArea(analyzePoints);
+  const bbArea = bounds.width * bounds.height;
+  const fillRatio = bbArea > 0 ? area / bbArea : 0;
+  const circ = circularity(analyzePoints);
+  const aspectRatio = bounds.width / Math.max(bounds.height, 1);
+
+  const epsilon = Math.max(bounds.width, bounds.height) * 0.04;
+  const simplified = rdpSimplify(analyzePoints, epsilon);
+  const vertexCount = simplified.length - (dist(simplified[0], simplified[simplified.length - 1]) < epsilon * 2 ? 1 : 0);
+
+  const hull = convexHull(analyzePoints);
+  const hullArea = shoelaceArea(hull);
+  const convexity = hullArea > 0 ? area / hullArea : 0;
+
+  const corners = detectCorners(analyzePoints, 35);
+  const cornerCount = corners.length;
+  const rightAngleFrac = cornerCount > 0 ? rightAngleFraction(analyzePoints, corners) : 0;
+  const curvVar = curvatureVariance(analyzePoints);
+  const cpScore = cornerPositionScore(analyzePoints, corners, bounds);
+  const closedConf = effectivelyClosed ? 1.0 : 0.85;
+
+  // Score each closed shape type independently
+  const candidates: RecognizedShape[] = [];
+
+  // Ellipse score
+  const ellipseScore = computeEllipseScore(circ, convexity, cornerCount, curvVar, rightAngleFrac, closedConf);
+  if (ellipseScore > 0.3) {
+    candidates.push({ type: "ellipse", confidence: ellipseScore, bounds: makeBounds() });
+  }
+
+  // Rectangle score
+  const rectScore = computeRectangleScore(cornerCount, fillRatio, convexity, rightAngleFrac, circ, aspectRatio, cpScore, closedConf);
+  if (rectScore > 0.3) {
+    candidates.push({ type: "rectangle", confidence: rectScore, bounds: makeBounds() });
+  }
+
+  // Diamond score
+  const diamondScoreVal = computeDiamondScore(cornerCount, fillRatio, convexity, vertexCount, aspectRatio, rightAngleFrac, cpScore, closedConf);
+  if (diamondScoreVal > 0.3) {
+    candidates.push({ type: "diamond", confidence: diamondScoreVal, bounds: makeBounds() });
+  }
+
+  // Triangle score
+  const triScore = computeTriangleScore(cornerCount, fillRatio, convexity, aspectRatio, vertexCount, closedConf);
+  if (triScore > 0.3) {
+    candidates.push({ type: "triangle", confidence: triScore, bounds: makeBounds() });
+  }
+
+  // Sort by confidence descending
+  candidates.sort((a, b) => b.confidence - a.confidence);
+
+  // Ensure primary is first if it matches a candidate
+  const primaryIdx = candidates.findIndex((c) => c.type === primary.type);
+  if (primaryIdx > 0) {
+    // Move primary to front but keep its score from recognizeShape
+    const [moved] = candidates.splice(primaryIdx, 1);
+    moved.confidence = Math.max(moved.confidence, primary.confidence);
+    candidates.unshift(moved);
+  } else if (primaryIdx === -1) {
+    // Primary not in candidates — add it first
+    candidates.unshift(primary);
+  }
+
+  // Deduplicate and cap
+  const seen = new Set<string>();
+  const result: RecognizedShape[] = [];
+  for (const c of candidates) {
+    if (!seen.has(c.type) && result.length < maxResults) {
+      seen.add(c.type);
+      result.push(c);
+    }
+  }
+
+  return result;
+}
+
+// ---- Independent scoring functions for each shape type ----
+
+function computeEllipseScore(
+  circ: number, convexity: number, cornerCount: number,
+  curvVar: number, rightAngleFrac: number, closedConf: number,
+): number {
+  let score = 0;
+  // High circularity is the primary signal
+  if (circ > 0.55) { score += circ * 0.5; }
+  // Low curvature variance = smooth curve
+  if (curvVar < 0.20) { score += (0.20 - curvVar) * 1.0; }
+  // Few corners
+  if (cornerCount <= 2) { score += 0.15; }
+  else if (cornerCount <= 3) { score += 0.05; }
+  // High convexity
+  if (convexity > 0.85) { score += 0.1; }
+  // Penalty for right angles (ellipses don't have them)
+  if (rightAngleFrac > 0.4) { score -= 0.2; }
+  return Math.min(1, score * closedConf);
+}
+
+function computeRectangleScore(
+  cornerCount: number, fillRatio: number, convexity: number,
+  rightAngleFrac: number, circ: number, aspectRatio: number,
+  cpScore: number, closedConf: number,
+): number {
+  let score = 0;
+  // Right angles are the strongest rectangle signal
+  if (rightAngleFrac >= 0.5) { score += rightAngleFrac * 0.35; }
+  else if (rightAngleFrac >= 0.3) { score += rightAngleFrac * 0.25; }
+  // High fill ratio
+  if (fillRatio > 0.60) { score += fillRatio * 0.25; }
+  // Corners near bbox corners (positive cpScore)
+  if (cpScore > 0) { score += cpScore * 0.2; }
+  // 3-6 corners expected
+  if (cornerCount >= 3 && cornerCount <= 6) { score += 0.1; }
+  // Not too circular
+  if (circ < 0.80) { score += 0.05; }
+  // Reasonable aspect ratio
+  if (aspectRatio > 0.15 && aspectRatio < 6.0) { score += 0.05; }
+  // Good convexity
+  if (convexity > 0.82) { score += 0.05; }
+  // Penalty for corners at edge midpoints (diamond signal)
+  if (cpScore < -0.3) { score -= 0.15; }
+  return Math.min(1, score * closedConf);
+}
+
+function computeDiamondScore(
+  cornerCount: number, fillRatio: number, convexity: number,
+  vertexCount: number, aspectRatio: number, rightAngleFrac: number,
+  cpScore: number, closedConf: number,
+): number {
+  let score = 0;
+  // Fill ratio around 0.50 is ideal for diamonds
+  if (fillRatio > 0.30 && fillRatio < 0.68) {
+    score += (1 - Math.abs(fillRatio - 0.50) * 3) * 0.3;
+  }
+  // Corners at edge midpoints (negative cpScore)
+  if (cpScore < 0) { score += Math.abs(cpScore) * 0.25; }
+  // ~4 vertices
+  if (vertexCount >= 4 && vertexCount <= 6) { score += 0.15; }
+  // 2-6 corners
+  if (cornerCount >= 2 && cornerCount <= 6) { score += 0.1; }
+  // Near-square aspect
+  if (aspectRatio > 0.35 && aspectRatio < 2.8) { score += 0.05; }
+  // Convexity
+  if (convexity > 0.82) { score += 0.05; }
+  // Penalty for strong right angles (rectangle signal)
+  if (rightAngleFrac > 0.5) { score -= 0.15; }
+  // Penalty for very high fill (rectangle territory)
+  if (fillRatio > 0.72) { score -= 0.1; }
+  return Math.min(1, score * closedConf);
+}
+
+function computeTriangleScore(
+  cornerCount: number, fillRatio: number, convexity: number,
+  aspectRatio: number, vertexCount: number, closedConf: number,
+): number {
+  let score = 0;
+  // ~3 corners
+  if (cornerCount >= 2 && cornerCount <= 4) { score += 0.2; }
+  if (cornerCount === 3) { score += 0.1; }
+  // Fill ratio ~0.50
+  if (fillRatio > 0.25 && fillRatio < 0.68) { score += 0.2; }
+  // 3 vertices ideal
+  if (vertexCount >= 3 && vertexCount <= 5) { score += 0.15; }
+  if (vertexCount === 3) { score += 0.1; }
+  // Convexity
+  if (convexity > 0.78) { score += 0.1; }
+  // Reasonable aspect
+  if (aspectRatio > 0.35 && aspectRatio < 2.5) { score += 0.05; }
+  // Penalty for too many corners (rectangle/diamond)
+  if (cornerCount > 4) { score -= 0.15; }
+  return Math.min(1, score * closedConf);
+}
+
+/**
  * Detect arrows from open stroke — looks for V-shaped head at either end.
  * Uses 3 methods for robustness:
  *   1. Shaft+head split: find straight shaft with non-straight tail
@@ -1154,10 +1458,10 @@ function detectArrow(
       const dy1 = pts[i].y - pts[i - step].y;
       const dx2 = pts[i + step].x - pts[i].x;
       const dy2 = pts[i + step].y - pts[i].y;
-      const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
-      const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
-      if (len1 < 1 || len2 < 1) { continue; }
-      const dot = (dx1 * dx2 + dy1 * dy2) / (len1 * len2);
+      const lenSq1 = dx1 * dx1 + dy1 * dy1;
+      const lenSq2 = dx2 * dx2 + dy2 * dy2;
+      if (lenSq1 < 1 || lenSq2 < 1) { continue; }
+      const dot = (dx1 * dx2 + dy1 * dy2) / Math.sqrt(lenSq1 * lenSq2);
       const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
       if (angle > maxAngleChange) {
         maxAngleChange = angle;

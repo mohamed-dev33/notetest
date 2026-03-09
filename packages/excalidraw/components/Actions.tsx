@@ -1182,7 +1182,7 @@ export const ShapesSwitcher = ({
       )}
       <div className="App-toolbar__divider" />
 
-      {activeTool.type === "freedraw" && (
+      {(activeTool.type === "freedraw" || (activeTool.type === "selection" && app.state.aiAutoSelectAfterRecognize && app.state.aiShapeRecognitionEnabled)) && (
         <>
           <ToolButton
             type="icon"
@@ -1195,71 +1195,12 @@ export const ShapesSwitcher = ({
             data-testid="toolbar-ai-shape"
             selected={app.state.aiShapeRecognitionEnabled}
             onClick={() => {
-              const turningOn = !app.state.aiShapeRecognitionEnabled;
               setAppState({
-                aiShapeRecognitionEnabled: turningOn,
-                ...(turningOn ? {
-                  aiHandwritingRecognitionEnabled: false,
-                  aiArabicHandwritingEnabled: false,
-                } : {}),
+                aiShapeRecognitionEnabled: !app.state.aiShapeRecognitionEnabled,
               } as any);
             }}
           />
-          <ToolButton
-            type="icon"
-            icon={<span style={{ fontSize: 16 }}>✍️</span>}
-            title={`AI Handwriting EN (${app.state.aiHandwritingRecognitionEnabled ? "ON" : "OFF"})`}
-            aria-label="AI Handwriting Recognition (English)"
-            className={clsx("Shape", {
-              fillable: app.state.aiHandwritingRecognitionEnabled,
-            })}
-            data-testid="toolbar-ai-handwriting"
-            selected={app.state.aiHandwritingRecognitionEnabled}
-            onClick={() => {
-              const turningOn = !app.state.aiHandwritingRecognitionEnabled;
-              setAppState({
-                aiHandwritingRecognitionEnabled: turningOn,
-                ...(turningOn ? {
-                  aiShapeRecognitionEnabled: false,
-                  aiArabicHandwritingEnabled: false,
-                } : {}),
-              } as any);
-              if (turningOn) {
-                import("../ai").then(({ preloadHandwritingEngine }) =>
-                  preloadHandwritingEngine(),
-                );
-              }
-            }}
-          />
-          <ToolButton
-            type="icon"
-            icon={<span style={{ fontSize: 14, fontWeight: "bold" }}>عر</span>}
-            title={`AI Arabic Handwriting (${app.state.aiArabicHandwritingEnabled ? "ON" : "OFF"})`}
-            aria-label="AI Arabic Handwriting Recognition"
-            className={clsx("Shape", {
-              fillable: app.state.aiArabicHandwritingEnabled,
-            })}
-            data-testid="toolbar-ai-arabic"
-            selected={app.state.aiArabicHandwritingEnabled}
-            onClick={() => {
-              const turningOn = !app.state.aiArabicHandwritingEnabled;
-              setAppState({
-                aiArabicHandwritingEnabled: turningOn,
-                ...(turningOn ? {
-                  aiShapeRecognitionEnabled: false,
-                  aiHandwritingRecognitionEnabled: false,
-                } : {}),
-              } as any);
-              if (turningOn) {
-                import("../ai").then(({ preloadArabicHandwritingEngine }) =>
-                  preloadArabicHandwritingEngine(),
-                );
-              }
-            }}
-          />
-          {(app.state.aiShapeRecognitionEnabled ||
-            app.state.aiHandwritingRecognitionEnabled ||
-            app.state.aiArabicHandwritingEnabled) && (
+          {app.state.aiShapeRecognitionEnabled && (
             <>
               <ToolButton
                 type="icon"
@@ -1272,8 +1213,9 @@ export const ShapesSwitcher = ({
                 data-testid="toolbar-ai-autoselect"
                 selected={app.state.aiAutoSelectAfterRecognize}
                 onClick={() => {
+                  const newValue = !app.state.aiAutoSelectAfterRecognize;
                   setAppState({
-                    aiAutoSelectAfterRecognize: !app.state.aiAutoSelectAfterRecognize,
+                    aiAutoSelectAfterRecognize: newValue,
                   } as any);
                 }}
               />
@@ -1287,14 +1229,9 @@ export const ShapesSwitcher = ({
                 onClick={() => {
                   setAppState({
                     aiShapeRecognitionEnabled: false,
-                    aiHandwritingRecognitionEnabled: false,
-                    aiArabicHandwritingEnabled: false,
+                    aiAutoSelectAfterRecognize: false,
                     aiRecognitionPending: null,
                   } as any);
-                  import("../ai").then(({ terminateHandwritingEngine, terminateArabicHandwritingEngine }) => {
-                    terminateHandwritingEngine();
-                    terminateArabicHandwritingEngine();
-                  });
                 }}
               />
             </>

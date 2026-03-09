@@ -84,7 +84,6 @@ export { actionToggleMidpointSnapping } from "./actionToggleMidpointSnapping";
 
 export { actionToggleStats } from "./actionToggleStats";
 export { actionToggleAIShapeRecognition } from "./actionToggleAIShapeRecognition";
-export { actionToggleAIHandwritingRecognition } from "./actionToggleAIHandwritingRecognition";
 export { actionUnbindText, actionBindText } from "./actionBoundText";
 export { actionLink } from "./actionLink";
 export { actionToggleElementLock } from "./actionElementLock";

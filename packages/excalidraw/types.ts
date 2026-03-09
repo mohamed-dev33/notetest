@@ -468,16 +468,16 @@ export interface AppState {
 
   /** AI recognition features */
   aiShapeRecognitionEnabled: boolean;
-  aiHandwritingRecognitionEnabled: boolean;
-  aiArabicHandwritingEnabled: boolean;
   /** When true, auto-select recognized shape with selection tool after accept */
   aiAutoSelectAfterRecognize: boolean;
   /** Pending AI recognition confirmation — shown as inline popup */
   aiRecognitionPending: {
-    type: "shape" | "text";
+    type: "shape";
     label: string;
     confidence: number;
     position: { x: number; y: number };
+    /** Alternative shape suggestions the user can pick from */
+    alternatives?: { label: string; confidence: number; onAccept: () => void }[];
     onAccept: () => void;
     onReject: () => void;
   } | null;

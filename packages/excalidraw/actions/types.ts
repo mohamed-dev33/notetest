@@ -145,8 +145,7 @@ export type ActionName =
   | "toggleLassoTool"
   | "toggleShapeSwitch"
   | "togglePolygon"
-  | "aiShapeRecognition"
-  | "aiHandwritingRecognition";
+  | "aiShapeRecognition";
 
 export type PanelComponentProps = {
   elements: readonly ExcalidrawElement[];

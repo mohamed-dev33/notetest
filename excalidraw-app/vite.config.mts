@@ -82,6 +82,10 @@ export default defineConfig(({ mode }) => {
         },
       ],
     },
+    // Drop console.log in production builds
+    esbuild: {
+      drop: process.env.NODE_ENV === "production" ? ["console", "debugger"] : [],
+    },
     build: {
       outDir: "build",
       rollupOptions: {
@@ -115,12 +119,24 @@ export default defineConfig(({ mode }) => {
             if (id.includes("@codemirror/") || id.includes("@lezer/")) {
               return "codemirror.chunk";
             }
+
+            // Code-split heavy deps for lazy loading
+            if (id.includes("firebase/") || id.includes("@firebase/")) {
+              return "firebase.chunk";
+            }
+
+            if (id.includes("roughjs/") || id.includes("path-data-parser") || id.includes("points-on-curve")) {
+              return "roughjs.chunk";
+            }
           },
         },
       },
-      sourcemap: true,
+      sourcemap: false,
       // don't auto-inline small assets (i.e. fonts hosted on CDN)
       assetsInlineLimit: 0,
+      // Drop console.log/warn in production for smaller bundle + less noise
+      minify: "esbuild",
+      target: "es2020",
     },
     plugins: [
       Sitemap({
@@ -203,7 +219,7 @@ export default defineConfig(({ mode }) => {
               },
             },
             {
-              urlPattern: new RegExp("(.chunk-.+|CodeMirrorEditor-.+)\\.js"),
+              urlPattern: new RegExp("(.chunk-.+|CodeMirrorEditor-.+|firebase\\.chunk|roughjs\\.chunk)\\.js"),
               handler: "CacheFirst",
               options: {
                 cacheName: "chunk",
@@ -214,7 +230,7 @@ export default defineConfig(({ mode }) => {
               },
             },
           ],
-          maximumFileSizeToCacheInBytes: 2.3 * 1024 ** 2, // 2.3MB
+          maximumFileSizeToCacheInBytes: 5 * 1024 ** 2, // 5MB
         },
         manifest: {
           short_name: "Excalidraw",

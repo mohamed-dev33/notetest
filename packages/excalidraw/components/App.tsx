@@ -645,8 +645,8 @@ class App extends React.Component<AppProps, AppState> {
   // AI Recognition debounce — wait for user to finish drawing before recognizing
   private aiRecognitionTimer: ReturnType<typeof setTimeout> | null = null;
   private aiPendingElements: ExcalidrawFreeDrawElement[] = [];
-  private aiLastStrokeTime: number = 0;
-  private aiStrokeIntervals: number[] = [];
+  // Cached AI module to avoid re-resolving dynamic import
+  private aiModule: typeof import("../ai") | null = null;
   // When true, clicking on empty canvas returns to freedraw (set after shape recognition)
   private aiReturnToFreedraw = false;
 
@@ -2111,6 +2111,7 @@ class App extends React.Component<AppProps, AppState> {
                             label={this.state.aiRecognitionPending.label}
                             confidence={this.state.aiRecognitionPending.confidence}
                             position={this.state.aiRecognitionPending.position}
+                            alternatives={this.state.aiRecognitionPending.alternatives}
                             onAccept={this.state.aiRecognitionPending.onAccept}
                             onReject={this.state.aiRecognitionPending.onReject}
                           />
@@ -3258,6 +3259,18 @@ class App extends React.Component<AppProps, AppState> {
   }
 
   componentDidUpdate(prevProps: AppProps, prevState: AppState) {
+    // AI auto-select: when toggled OFF while in selection mode from auto-select,
+    // immediately return to freedraw
+    if (
+      prevState.aiAutoSelectAfterRecognize &&
+      !this.state.aiAutoSelectAfterRecognize &&
+      this.aiReturnToFreedraw
+    ) {
+      this.aiReturnToFreedraw = false;
+      this.setActiveTool({ type: "freedraw" });
+      this.setState({ selectedElementIds: {} });
+    }
+
     this.updateEmbeddables();
     const elements = this.scene.getElementsIncludingDeleted();
     const elementsMap = this.scene.getElementsMapIncludingDeleted();
@@ -7404,22 +7417,34 @@ class App extends React.Component<AppProps, AppState> {
     this.clearSelectionIfNotUsingSelection();
 
     // AI Recognition: if we just recognized a shape and are in selection tool,
-    // check if user clicked empty canvas → return to freedraw
+    // check if user clicked empty canvas → return to freedraw.
+    // Only trigger on actual canvas clicks (not toolbar/UI), and only if toggle is still ON.
     if (
       this.aiReturnToFreedraw &&
-      this.state.activeTool.type === "selection"
+      this.state.activeTool.type === "selection" &&
+      this.state.aiAutoSelectAfterRecognize
     ) {
-      const hitEl = this.getElementAtPosition(
-        pointerDownState.origin.x,
-        pointerDownState.origin.y,
-      );
-      if (!hitEl) {
+      // Verify click target is the canvas, not a UI element (toolbar, popup, etc.)
+      const target = event.target as HTMLElement | null;
+      const isCanvasClick = target?.closest(".excalidraw__canvas") != null
+        || target?.tagName === "CANVAS";
+
+      if (isCanvasClick) {
+        const hitEl = this.getElementAtPosition(
+          pointerDownState.origin.x,
+          pointerDownState.origin.y,
+        );
+        if (!hitEl) {
+          this.aiReturnToFreedraw = false;
+          this.setActiveTool({ type: "freedraw" });
+          this.setState({ selectedElementIds: {} });
+          return;
+        }
+        // Clicked on an element — clear the flag, stay in selection
         this.aiReturnToFreedraw = false;
-        this.setActiveTool({ type: "freedraw" });
-        this.setState({ selectedElementIds: {} });
-        return;
       }
-      // Clicked on an element — clear the flag, stay in selection
+    } else if (this.aiReturnToFreedraw && !this.state.aiAutoSelectAfterRecognize) {
+      // Toggle was turned off while flag was set — clear it
       this.aiReturnToFreedraw = false;
     }
 
@@ -8561,76 +8586,28 @@ class App extends React.Component<AppProps, AppState> {
 
   /**
    * Queue a freedraw element for debounced AI recognition.
-   * Resets the timer on each new stroke so recognition only fires
-   * after the user pauses drawing for AI_RECOGNITION_DELAY_MS.
-   */
-  /**
-   * Queue a freedraw element for debounced AI recognition.
-   * Resets the timer on each new stroke so recognition only fires
-   * after the user pauses drawing.
-   *
-   * Debounce is shorter for shape-only (lines/arrows are fast),
-   * longer when handwriting is enabled (need to finish writing).
+   * Each new stroke resets the timer. When the timer fires, ALL pending
+   * elements are processed — each independently recognized.
    */
   private queueAIRecognition = (element: ExcalidrawFreeDrawElement) => {
-    const now = Date.now();
-
-    // Track inter-stroke intervals to learn writing speed
-    if (this.aiLastStrokeTime > 0 && this.aiPendingElements.length > 0) {
-      const gap = now - this.aiLastStrokeTime;
-      // Only track reasonable gaps (50ms-5s) — ignore very short or long pauses
-      if (gap >= 50 && gap <= 5000) {
-        this.aiStrokeIntervals.push(gap);
-        // Keep last 10 intervals to adapt to current writing pace
-        if (this.aiStrokeIntervals.length > 10) {
-          this.aiStrokeIntervals.shift();
-        }
-      }
-    }
-    this.aiLastStrokeTime = now;
-
     this.aiPendingElements.push(element);
 
     if (this.aiRecognitionTimer) {
       clearTimeout(this.aiRecognitionTimer);
     }
 
-    const isHandwriting = this.state.aiHandwritingRecognitionEnabled || this.state.aiArabicHandwritingEnabled;
-
-    // Compute adaptive delay based on writing speed
-    let delay: number;
-    if (!isHandwriting) {
-      // Shape recognition: short fixed delay
-      delay = 800;
-    } else if (this.aiStrokeIntervals.length >= 2) {
-      // Adaptive: wait 2.5x the average inter-stroke gap (clamped 1.5s-5s)
-      // This means if user writes chars every 400ms, we wait 1.5s after last stroke
-      // If user writes slowly (1s between strokes), we wait 2.5s
-      const avg = this.aiStrokeIntervals.reduce((a, b) => a + b, 0) / this.aiStrokeIntervals.length;
-      delay = Math.max(1500, Math.min(5000, avg * 2.5));
-    } else {
-      // Not enough data yet — use generous default for first word
-      delay = 3000;
-    }
-
-    this.setToast({
-      message: `🔍 AI waiting for you to finish${isHandwriting ? " writing" : ""}...`,
-      closable: false,
-      duration: delay + 500,
-    });
-
+    // 600ms debounce — short enough to feel responsive, long enough
+    // to catch multi-stroke shapes (e.g., triangle drawn as 3 strokes)
     this.aiRecognitionTimer = setTimeout(() => {
-      // Reset stroke tracking for next recognition cycle
-      this.aiStrokeIntervals = [];
-      this.aiLastStrokeTime = 0;
       this.processAIRecognitionBatch();
-    }, delay);
+    }, 600);
   };
 
   /**
-   * Process all queued freedraw elements as a batch after debounce.
-   * Lines/arrows are applied immediately (no confirmation).
-   * Other shapes and text show a confirmation popup.
+   * Process all queued freedraw elements.
+   * The batch processor in ai/index.ts returns an array of results — one per
+   * individually recognized shape. We apply ALL of them: lines/arrows
+   * immediately, closed shapes via confirmation popup (last one only).
    */
   private processAIRecognitionBatch = async () => {
     const elements = [...this.aiPendingElements];
@@ -8641,102 +8618,94 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
-    // If user clicked stop while debounce was pending, bail out
-    if (
-      !this.state.aiShapeRecognitionEnabled &&
-      !this.state.aiHandwritingRecognitionEnabled &&
-      !this.state.aiArabicHandwritingEnabled
-    ) {
-      this.setToast({ message: "" });
+    if (!this.state.aiShapeRecognitionEnabled) {
       return;
     }
 
-    this.setToast({
-      message: "🧠 Recognizing...",
-      closable: false,
-      duration: 30000,
-    });
-
     try {
-      const { processFreedrawBatch } = await import("../ai");
-      const result = await processFreedrawBatch(
+      if (!this.aiModule) {
+        this.aiModule = await import("../ai");
+      }
+      const { processFreedrawBatch } = this.aiModule;
+      const results = await processFreedrawBatch(
         elements,
         this.state.aiShapeRecognitionEnabled,
-        this.state.aiHandwritingRecognitionEnabled,
-        this.state.aiArabicHandwritingEnabled,
       );
 
-
-      if (result.type === "none") {
-        this.setToast({ message: "" });
+      if (results.length === 0) {
         return;
       }
 
-      this.setToast({ message: "" });
-      const consumed = result.consumedElements ?? elements;
+      // Apply ALL results — lines/arrows immediately, last closed shape gets popup
+      let lastClosedResult: (typeof results)[number] | null = null;
 
-      // Lines and arrows: apply immediately without confirmation
-      if (
-        result.type === "shape" &&
-        result.shape &&
-        (result.shape.type === "line" || result.shape.type === "arrow")
-      ) {
-        this.applyShapeRecognition(result.shape, consumed);
-        return;
+      for (const result of results) {
+        if (!result.shape) { continue; }
+        const consumed = result.consumedElements ?? [];
+
+        if (result.shape.type === "line" || result.shape.type === "arrow") {
+          // Lines/arrows: apply immediately
+          this.applyShapeRecognition(result.shape, consumed);
+        } else {
+          // Closed shapes: if we already had one pending, apply it immediately
+          // (no popup), keep only the LAST one for the popup
+          if (lastClosedResult?.shape) {
+            this.applyShapeRecognition(
+              lastClosedResult.shape,
+              lastClosedResult.consumedElements ?? [],
+            );
+          }
+          lastClosedResult = result;
+        }
       }
 
-      // Everything else: show confirmation popup
-      let gMinX = Infinity, gMinY = Infinity, gMaxX = -Infinity, gMaxY = -Infinity;
-      for (const el of consumed) {
-        gMinX = Math.min(gMinX, el.x);
-        gMinY = Math.min(gMinY, el.y);
-        gMaxX = Math.max(gMaxX, el.x + el.width);
-        gMaxY = Math.max(gMaxY, el.y + el.height);
-      }
-      const centerX = (gMinX + gMaxX) / 2;
-      const popupY = gMinY - 10;
+      // Show confirmation popup for the last closed shape
+      if (lastClosedResult?.shape) {
+        const consumed = lastClosedResult.consumedElements ?? [];
+        let gMinX = Infinity, gMinY = Infinity, gMaxX = -Infinity, gMaxY = -Infinity;
+        for (const el of consumed) {
+          gMinX = Math.min(gMinX, el.x);
+          gMinY = Math.min(gMinY, el.y);
+          gMaxX = Math.max(gMaxX, el.x + el.width);
+          gMaxY = Math.max(gMaxY, el.y + el.height);
+        }
+        const centerX = (gMinX + gMaxX) / 2;
+        const popupY = gMinY - 10;
 
-      const { scrollX, scrollY, zoom } = this.state;
-      const screenX = (centerX + scrollX) * zoom.value;
-      const screenY = (popupY + scrollY) * zoom.value;
+        const { scrollX, scrollY, zoom } = this.state;
+        const screenX = (centerX + scrollX) * zoom.value;
+        const screenY = (popupY + scrollY) * zoom.value;
 
-      const label =
-        result.type === "shape" && result.shape
-          ? result.shape.type
-          : result.type === "text" && result.handwriting
-            ? `"${result.handwriting.text}"`
-            : "";
+        const label = lastClosedResult.shape.type;
+        const confidence = lastClosedResult.shape.confidence * 100;
+        const shapeForAccept = lastClosedResult.shape;
 
-      const confidence =
-        result.type === "shape" && result.shape
-          ? result.shape.confidence * 100
-          : result.type === "text" && result.handwriting
-            ? result.handwriting.confidence
-            : 0;
-
-      this.setState({
-        aiRecognitionPending: {
-          type: result.type as "shape" | "text",
-          label,
-          confidence,
-          position: { x: screenX, y: screenY },
+        const alternatives = lastClosedResult.alternatives?.map((alt) => ({
+          label: alt.type,
+          confidence: alt.confidence * 100,
           onAccept: () => {
-            if (result.type === "shape" && result.shape) {
-              // applyShapeRecognition clears aiRecognitionPending itself
-              this.applyShapeRecognition(result.shape, consumed);
-            } else if (result.type === "text" && result.handwriting) {
-              this.applyHandwritingRecognition(result.handwriting, consumed);
+            this.applyShapeRecognition(alt, consumed);
+          },
+        }));
+
+        this.setState({
+          aiRecognitionPending: {
+            type: "shape",
+            label,
+            confidence,
+            position: { x: screenX, y: screenY },
+            alternatives,
+            onAccept: () => {
+              this.applyShapeRecognition(shapeForAccept, consumed);
+            },
+            onReject: () => {
               this.setState({ aiRecognitionPending: null });
-            }
+            },
           },
-          onReject: () => {
-            this.setState({ aiRecognitionPending: null });
-          },
-        },
-      });
+        });
+      }
     } catch (error) {
       console.error("AI Recognition error:", error);
-      this.setToast({ message: "" });
     }
   };
 
@@ -8885,8 +8854,6 @@ class App extends React.Component<AppProps, AppState> {
     if (!isLineOrArrow && this.state.aiAutoSelectAfterRecognize) {
       this.setActiveTool({ type: "selection" });
       this.aiReturnToFreedraw = true;
-      // Use requestAnimationFrame to ensure the element is rendered before selecting,
-      // so the properties panel shows immediately.
       requestAnimationFrame(() => {
         this.setState({
           selectedElementIds: { [replacementElement.id]: true },
@@ -8896,78 +8863,6 @@ class App extends React.Component<AppProps, AppState> {
     } else {
       this.setState({ aiRecognitionPending: null });
     }
-
-    this.setToast({
-      message: `✨ Recognized: ${shape.type} (${Math.round(shape.confidence * 100)}%)`,
-      closable: true,
-      duration: 2000,
-    });
-  };
-
-  /**
-   * Apply handwriting recognition — delete freedraw(s), insert text element.
-   */
-  private applyHandwritingRecognition = (
-    handwriting: import("../ai").HandwritingResult,
-    freedrawElements: ExcalidrawFreeDrawElement[],
-  ) => {
-    const { text } = handwriting;
-
-    let globalMinX = Infinity, globalMinY = Infinity;
-    let globalMaxX = -Infinity, globalMaxY = -Infinity;
-    for (const el of freedrawElements) {
-      const elMinX = el.x + Math.min(...el.points.map((p) => p[0]));
-      const elMinY = el.y + Math.min(...el.points.map((p) => p[1]));
-      const elMaxX = el.x + Math.max(...el.points.map((p) => p[0]));
-      const elMaxY = el.y + Math.max(...el.points.map((p) => p[1]));
-      globalMinX = Math.min(globalMinX, elMinX);
-      globalMinY = Math.min(globalMinY, elMinY);
-      globalMaxX = Math.max(globalMaxX, elMaxX);
-      globalMaxY = Math.max(globalMaxY, elMaxY);
-    }
-
-    const totalHeight = globalMaxY - globalMinY;
-    const firstEl = freedrawElements[0];
-
-    for (const el of freedrawElements) {
-      this.scene.mutateElement(el, { isDeleted: true });
-    }
-
-    const estimatedFontSize = Math.max(16, Math.min(72, totalHeight * 0.7));
-
-    // Detect Arabic text for RTL alignment
-    const hasArabic = /[\u0600-\u06FF]/.test(text);
-    const textAlign = hasArabic ? "right" : this.state.currentItemTextAlign;
-
-    const textElement = newTextElement({
-      x: globalMinX,
-      y: globalMinY,
-      strokeColor: firstEl.strokeColor,
-      backgroundColor: firstEl.backgroundColor,
-      fillStyle: firstEl.fillStyle,
-      strokeWidth: firstEl.strokeWidth,
-      strokeStyle: firstEl.strokeStyle,
-      roughness: this.state.currentItemRoughness,
-      opacity: firstEl.opacity,
-      locked: false,
-      frameId: firstEl.frameId,
-      text,
-      fontSize: estimatedFontSize,
-      fontFamily: this.state.currentItemFontFamily,
-      textAlign,
-      angle: 0 as Radians,
-    });
-
-    this.scene.insertElement(textElement);
-    this.setState({
-      selectedElementIds: { [textElement.id]: true },
-    });
-
-    this.setToast({
-      message: `✨ Recognized text: "${text}" (${Math.round(handwriting.confidence)}%)`,
-      closable: true,
-      duration: 3000,
-    });
   };
 
   public insertIframeElement = ({
@@ -10747,12 +10642,7 @@ class App extends React.Component<AppProps, AppState> {
         this.actionManager.executeAction(actionFinalize);
 
         // AI Recognition: queue the element for debounced recognition
-        // (waits for user to finish all strokes before recognizing)
-        if (
-          this.state.aiShapeRecognitionEnabled ||
-          this.state.aiHandwritingRecognitionEnabled ||
-          this.state.aiArabicHandwritingEnabled
-        ) {
+        if (this.state.aiShapeRecognitionEnabled) {
           this.queueAIRecognition(newElement);
         }
 

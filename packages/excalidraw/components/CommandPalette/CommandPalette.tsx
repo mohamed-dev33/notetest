@@ -374,7 +374,6 @@ function CommandPaletteInner({
         actionManager.actions.gridMode,
         actionManager.actions.objectsSnapMode,
         actionManager.actions.aiShapeRecognition,
-        actionManager.actions.aiHandwritingRecognition,
         actionManager.actions.toggleShortcuts,
         actionManager.actions.selectAll,
         actionManager.actions.toggleElementLock,

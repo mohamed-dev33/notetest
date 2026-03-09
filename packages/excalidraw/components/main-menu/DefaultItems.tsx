@@ -18,7 +18,6 @@ import {
   actionToggleTheme,
   actionToggleZenMode,
   actionToggleAIShapeRecognition,
-  actionToggleAIHandwritingRecognition,
 } from "../../actions";
 import { actionToggleViewMode } from "../../actions/actionToggleViewMode";
 import { getShortcutFromShortcutName } from "../../actions/shortcuts";
@@ -571,23 +570,6 @@ const PreferencesToggleAIShapeRecognitionItem = () => {
   );
 };
 
-const PreferencesToggleAIHandwritingRecognitionItem = () => {
-  const { t } = useI18n();
-  const actionManager = useExcalidrawActionManager();
-  const appState = useUIAppState();
-  return (
-    <DropdownMenuItemCheckbox
-      checked={appState.aiHandwritingRecognitionEnabled}
-      onSelect={(event) => {
-        actionManager.executeAction(actionToggleAIHandwritingRecognition);
-        event.preventDefault();
-      }}
-    >
-      {t("buttons.aiHandwritingRecognition")}
-    </DropdownMenuItemCheckbox>
-  );
-};
-
 export const Preferences = ({
   children,
   additionalItems,
@@ -613,7 +595,6 @@ export const Preferences = ({
             <PreferencesToggleArrowBindingItem />
             <PreferencesToggleMidpointSnappingItem />
             <PreferencesToggleAIShapeRecognitionItem />
-            <PreferencesToggleAIHandwritingRecognitionItem />
           </>
         )}
         {additionalItems}
@@ -631,6 +612,5 @@ Preferences.ToggleZenMode = PreferencesToggleZenModeItem;
 Preferences.ToggleViewMode = PreferencesToggleViewModeItem;
 Preferences.ToggleElementProperties = PreferencesToggleElementPropertiesItem;
 Preferences.ToggleAIShapeRecognition = PreferencesToggleAIShapeRecognitionItem;
-Preferences.ToggleAIHandwritingRecognition = PreferencesToggleAIHandwritingRecognitionItem;
 
 Preferences.displayName = "Preferences";
