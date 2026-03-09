@@ -8541,6 +8541,14 @@ class App extends React.Component<AppProps, AppState> {
    * Resets the timer on each new stroke so recognition only fires
    * after the user pauses drawing for AI_RECOGNITION_DELAY_MS.
    */
+  /**
+   * Queue a freedraw element for debounced AI recognition.
+   * Resets the timer on each new stroke so recognition only fires
+   * after the user pauses drawing.
+   *
+   * Debounce is shorter for shape-only (lines/arrows are fast),
+   * longer when handwriting is enabled (need to finish writing).
+   */
   private queueAIRecognition = (element: ExcalidrawFreeDrawElement) => {
     this.aiPendingElements.push(element);
 
@@ -8548,19 +8556,26 @@ class App extends React.Component<AppProps, AppState> {
       clearTimeout(this.aiRecognitionTimer);
     }
 
+    // Longer delay when handwriting is enabled so user can finish words
+    const delay = this.state.aiHandwritingRecognitionEnabled
+      ? 2000
+      : 800;
+
     this.setToast({
       message: "🔍 AI recognition waiting...",
       closable: false,
-      duration: App.AI_RECOGNITION_DELAY_MS + 500,
+      duration: delay + 500,
     });
 
     this.aiRecognitionTimer = setTimeout(() => {
       this.processAIRecognitionBatch();
-    }, App.AI_RECOGNITION_DELAY_MS);
+    }, delay);
   };
 
   /**
    * Process all queued freedraw elements as a batch after debounce.
+   * Lines/arrows are applied immediately (no confirmation).
+   * Other shapes and text show a confirmation popup.
    */
   private processAIRecognitionBatch = async () => {
     const elements = [...this.aiPendingElements];
@@ -8593,7 +8608,17 @@ class App extends React.Component<AppProps, AppState> {
       this.setToast({ message: "" });
       const consumed = result.consumedElements ?? elements;
 
-      // Compute popup position (center of consumed elements, in screen coords)
+      // Lines and arrows: apply immediately without confirmation
+      if (
+        result.type === "shape" &&
+        result.shape &&
+        (result.shape.type === "line" || result.shape.type === "arrow")
+      ) {
+        this.applyShapeRecognition(result.shape, consumed);
+        return;
+      }
+
+      // Everything else: show confirmation popup
       let gMinX = Infinity, gMinY = Infinity, gMaxX = -Infinity, gMaxY = -Infinity;
       for (const el of consumed) {
         gMinX = Math.min(gMinX, el.x);
@@ -8604,7 +8629,6 @@ class App extends React.Component<AppProps, AppState> {
       const centerX = (gMinX + gMaxX) / 2;
       const popupY = gMinY - 10;
 
-      // Convert scene coords to screen coords
       const { scrollX, scrollY, zoom } = this.state;
       const screenX = (centerX + scrollX) * zoom.value;
       const screenY = (popupY + scrollY) * zoom.value;
@@ -8784,6 +8808,8 @@ class App extends React.Component<AppProps, AppState> {
     }
 
     this.scene.insertElement(replacementElement);
+
+    // Select the new shape so its properties panel shows (stay on freedraw tool)
     this.setState({
       selectedElementIds: { [replacementElement.id]: true },
     });

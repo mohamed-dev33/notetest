@@ -68,6 +68,19 @@ export async function processFreedrawElement(
       })
     : Promise.resolve();
 
+  // For line/arrow: shape recognition is instant and reliable — return immediately
+  // without waiting for slow handwriting OCR
+  await shapePromise;
+
+  const quickShape = shapeResult as RecognizedShape | null;
+  if (
+    quickShape &&
+    (quickShape.type === "line" || quickShape.type === "arrow") &&
+    quickShape.confidence >= SHAPE_CONFIDENCE_THRESHOLD
+  ) {
+    return { type: "shape", shape: quickShape, consumedElements: [element] };
+  }
+
   const hwPromise = handwritingRecognitionEnabled
     ? recognizeHandwriting(points, element.strokeWidth, true).then((r) => {
         if (r.text.length > 0 && r.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD) {
@@ -76,7 +89,7 @@ export async function processFreedrawElement(
       })
     : Promise.resolve();
 
-  await Promise.all([shapePromise, hwPromise]);
+  await hwPromise;
 
   const sr = shapeResult as RecognizedShape | null;
   const hr = hwResult as HandwritingResult | null;
@@ -105,6 +118,52 @@ export async function processFreedrawElement(
   }
 
   return noResult;
+}
+
+/**
+ * Check if a set of strokes look like separate characters (text)
+ * vs parts of a single connected shape.
+ *
+ * Text strokes tend to have clear horizontal separation and similar heights.
+ * Shape strokes tend to overlap or connect.
+ */
+function checkStrokesAreSeparateChars(
+  elements: ExcalidrawFreeDrawElement[],
+): boolean {
+  if (elements.length < 2) { return false; }
+  if (elements.length > 20) { return false; }
+
+  // Get bounding box of each stroke
+  const boxes = elements.map((el) => {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of el.points as readonly LocalPoint[]) {
+      minX = Math.min(minX, el.x + p[0]);
+      minY = Math.min(minY, el.y + p[1]);
+      maxX = Math.max(maxX, el.x + p[0]);
+      maxY = Math.max(maxY, el.y + p[1]);
+    }
+    return { minX, minY, maxX, maxY };
+  });
+
+  // Check if strokes have similar vertical extent (like text on a line)
+  const allMinY = Math.min(...boxes.map((b) => b.minY));
+  const allMaxY = Math.max(...boxes.map((b) => b.maxY));
+  const totalHeight = allMaxY - allMinY;
+
+  if (totalHeight < 5) { return false; }
+
+  // Count strokes with similar vertical position (on same "text line")
+  let sameLineCount = 0;
+  for (const box of boxes) {
+    const vertOverlap = (Math.min(allMaxY, box.maxY) - Math.max(allMinY, box.minY)) / totalHeight;
+    const strokeH = box.maxY - box.minY;
+    if (vertOverlap > 0.3 || strokeH < totalHeight * 0.3) {
+      sameLineCount++;
+    }
+  }
+
+  // If most strokes share a similar vertical baseline, it's likely text
+  return sameLineCount >= elements.length * 0.7;
 }
 
 /**
@@ -139,8 +198,13 @@ export async function processFreedrawBatch(
   let shapeResult: RecognizedShape | null = null;
   let hwResult: HandwritingResult | null = null;
 
-  // Shape: combine all strokes into one path
-  const shapePromise = shapeRecognitionEnabled
+  // Heuristic: check if strokes look like separate characters (text)
+  // vs a single connected drawing (shape)
+  const strokesLikeSeparateChars = checkStrokesAreSeparateChars(elements);
+  console.log(`[AI] Multi-stroke: ${elements.length} strokes, separateChars=${strokesLikeSeparateChars}`);
+
+  // Shape: only try if strokes don't look like separate characters
+  const shapePromise = (shapeRecognitionEnabled && !strokesLikeSeparateChars)
     ? Promise.resolve().then(() => {
         const combinedPoints: LocalPoint[] = [];
         let globalMinX = Infinity, globalMinY = Infinity;

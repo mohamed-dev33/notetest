@@ -22,6 +22,37 @@ export interface HandwritingResult {
 // =====================================================================
 
 /**
+ * Simple box blur (approximation of Gaussian) to soften rendered strokes.
+ * Makes mouse-drawn strokes look more like scanned handwriting.
+ */
+function applyGaussianBlur(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  radius: number,
+): void {
+  if (radius <= 0) { return; }
+  // Use canvas filter if available (fast, hardware accelerated)
+  if ("filter" in ctx) {
+    const imgData = ctx.getImageData(0, 0, w, h);
+    ctx.filter = `blur(${radius}px)`;
+    ctx.putImageData(imgData, 0, 0);
+    // Draw over itself with blur
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = w;
+    tempCanvas.height = h;
+    const tempCtx = tempCanvas.getContext("2d")!;
+    tempCtx.drawImage(ctx.canvas, 0, 0);
+    ctx.filter = `blur(${radius}px)`;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(tempCanvas, 0, 0);
+    ctx.filter = "none";
+  }
+}
+
+/**
  * Render points for TrOCR — natural-looking handwriting.
  * TrOCR was trained on IAM dataset: dark gray ink on light background,
  * anti-aliased, ~384px height images. NO binarization.
@@ -90,8 +121,9 @@ function renderForTrOCR(
 }
 
 /**
- * Render points for Tesseract — high-contrast binarized image.
- * Tesseract works best with pure black text on white background.
+ * Render points for Tesseract — high-contrast at optimal DPI.
+ * Tesseract works best with text ~40-50px tall and proportionally thick strokes.
+ * No binarization — Tesseract handles internally.
  */
 function renderForTesseract(
   points: readonly LocalPoint[],
@@ -111,15 +143,16 @@ function renderForTesseract(
   const rawH = maxY - minY;
   if (rawW < 3 && rawH < 3) { return null; }
 
-  const targetH = 400;
-  const padding = 48;
-  const scale = Math.max(2.0, targetH / Math.max(rawH, 1));
+  // Optimal: ~48px text height for Tesseract
+  const targetH = 48;
+  const padding = 16;
+  const scale = Math.max(1.0, targetH / Math.max(rawH, 1));
   const canvasW = Math.ceil(rawW * scale + padding * 2);
   const canvasH = Math.ceil(rawH * scale + padding * 2);
 
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(canvasW, targetH);
-  canvas.height = Math.max(canvasH, targetH);
+  canvas.width = Math.max(canvasW, 64);
+  canvas.height = Math.max(canvasH, 64);
 
   const ctx = canvas.getContext("2d")!;
   if (!ctx) { return null; }
@@ -127,8 +160,10 @@ function renderForTesseract(
   ctx.fillStyle = "#FFFFFF";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+  // Proportional stroke width: ~10% of text height
+  const sw = Math.max(3, Math.min(8, targetH * 0.10));
   ctx.strokeStyle = "#000000";
-  ctx.lineWidth = Math.max(6, strokeWidth * scale * 1.5);
+  ctx.lineWidth = sw;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
@@ -149,17 +184,8 @@ function renderForTesseract(
   }
   ctx.stroke();
 
-  // Binarize for Tesseract
-  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const data = imgData.data;
-  for (let i = 0; i < data.length; i += 4) {
-    const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
-    const val = gray < 200 ? 0 : 255;
-    data[i] = val;
-    data[i + 1] = val;
-    data[i + 2] = val;
-  }
-  ctx.putImageData(imgData, 0, 0);
+  // Slight blur to mimic scanned text
+  applyGaussianBlur(ctx, canvas.width, canvas.height, 0.8);
 
   return canvas;
 }
@@ -234,7 +260,7 @@ function renderMultiStrokeForTrOCR(
 }
 
 /**
- * Multi-stroke rendering for Tesseract (binarized)
+ * Multi-stroke rendering for Tesseract — optimal DPI, proportional strokes.
  */
 function renderMultiStrokeForTesseract(
   strokes: readonly { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[],
@@ -258,15 +284,15 @@ function renderMultiStrokeForTesseract(
   const rawH = maxY - minY;
   if (rawW < 3 && rawH < 3) { return null; }
 
-  const targetH = 400;
-  const padding = 48;
-  const scale = Math.max(2.0, targetH / Math.max(rawH, 1));
+  const targetH = 48;
+  const padding = 16;
+  const scale = Math.max(1.0, targetH / Math.max(rawH, 1));
   const canvasW = Math.ceil(rawW * scale + padding * 2);
   const canvasH = Math.ceil(rawH * scale + padding * 2);
 
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(canvasW, targetH);
-  canvas.height = Math.max(canvasH, targetH);
+  canvas.width = Math.max(canvasW, 64);
+  canvas.height = Math.max(canvasH, 64);
 
   const ctx = canvas.getContext("2d")!;
   if (!ctx) { return null; }
@@ -274,8 +300,9 @@ function renderMultiStrokeForTesseract(
   ctx.fillStyle = "#FFFFFF";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+  const sw = Math.max(3, Math.min(8, targetH * 0.10));
   ctx.strokeStyle = "#000000";
-  ctx.lineWidth = Math.max(6, strokeWidth * scale * 1.5);
+  ctx.lineWidth = sw;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
@@ -299,17 +326,7 @@ function renderMultiStrokeForTesseract(
     ctx.stroke();
   }
 
-  // Binarize
-  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const data = imgData.data;
-  for (let i = 0; i < data.length; i += 4) {
-    const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
-    const val = gray < 200 ? 0 : 255;
-    data[i] = val;
-    data[i + 1] = val;
-    data[i + 2] = val;
-  }
-  ctx.putImageData(imgData, 0, 0);
+  applyGaussianBlur(ctx, canvas.width, canvas.height, 0.8);
 
   return canvas;
 }
@@ -433,19 +450,14 @@ async function ensureTesseract(): Promise<any> {
       tesseractWorker = await Tesseract.createWorker("eng", 1, {
         logger: () => {},
       });
-      // CRITICAL: Disable dictionary-based word correction
-      // This prevents Tesseract from "fixing" handwritten text
-      // (e.g. "youssef" → "you say" or "brows")
+      // Use PSM 7 (single text line) with dictionary — dictionary helps
+      // form real words from noisy handwriting input
       await tesseractWorker.setParameters({
         tessedit_pageseg_mode: "7",
         preserve_interword_spaces: "1",
-        load_system_dawg: "0",
-        load_freq_dawg: "0",
-        language_model_penalty_non_dict_word: "0",
-        language_model_penalty_non_freq_dict_word: "0",
         tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,!?'-:;()@#$%&",
       });
-      console.log("[AI] Tesseract worker ready (dictionary disabled)");
+      console.log("[AI] Tesseract worker ready");
     } catch (e) {
       console.error("[AI] Tesseract initialization failed:", e);
       tesseractWorker = null;
@@ -466,16 +478,11 @@ async function recognizeWithTesseract(
     const worker = await ensureTesseract();
     if (!worker) { return noResult; }
 
-    // Use PSM 13 (raw line) — best for handwriting, no dictionary correction
-    await worker.setParameters({
-      tessedit_pageseg_mode: "13",
-      load_system_dawg: "0",
-      load_freq_dawg: "0",
-    });
-
     const { data } = await worker.recognize(canvas);
     let text = data.text.trim().replace(/\n+/g, " ");
     const conf = data.confidence;
+
+    console.log(`[AI] Tesseract raw: "${text}" conf=${conf}`);
 
     if (text.length === 0 || conf < 15) {
       return noResult;
@@ -488,11 +495,43 @@ async function recognizeWithTesseract(
       .replace(/\s{2,}/g, " ")
       .trim();
 
+    // Garbage detection: reject repeated characters
+    if (isGarbageText(text)) {
+      console.log(`[AI] Tesseract garbage rejected: "${text}"`);
+      return noResult;
+    }
+
     return { text, confidence: conf };
   } catch (e) {
     console.error("[AI] Tesseract recognition error:", e);
     return noResult;
   }
+}
+
+/**
+ * Detect garbage OCR output: repeated characters, too many digits in a row,
+ * or text that's clearly not meaningful.
+ */
+function isGarbageText(text: string): boolean {
+  if (text.length === 0) { return true; }
+
+  const cleaned = text.replace(/\s/g, "");
+  if (cleaned.length === 0) { return true; }
+
+  // Single letter/digit is valid
+  if (cleaned.length === 1) { return false; }
+
+  // All same character (but not single char)
+  if (new Set(cleaned).size <= 1 && cleaned.length > 1) { return true; }
+
+  // More than 4 consecutive same characters
+  if (/(.)\1{3,}/.test(cleaned)) { return true; }
+
+  // More than 60% digits with length > 3 (unlikely to be handwritten text)
+  const digits = (cleaned.match(/\d/g) || []).length;
+  if (digits > cleaned.length * 0.6 && cleaned.length > 3) { return true; }
+
+  return false;
 }
 
 // =====================================================================
@@ -561,12 +600,13 @@ export async function recognizeHandwriting(
         const trCanvas = renderForTrOCR(points, strokeWidth);
         if (trCanvas) {
           const r = await recognizeWithTrOcrWorker(trCanvas);
-          if (r.text.length > 0) { results.push(r); }
+          console.log(`[AI] TrOCR single: "${r.text}" conf=${r.confidence}`);
+          if (r.text.length > 0 && !isGarbageText(r.text)) { results.push(r); }
         }
       })()
     : Promise.resolve();
 
-  // Tesseract with binarized rendering (400px)
+  // Tesseract with optimized rendering (48px)
   const tessPromise = (async () => {
     const tessCanvas = renderForTesseract(points, strokeWidth);
     if (tessCanvas) {
@@ -606,10 +646,14 @@ export async function recognizeHandwritingMultiStroke(
         const trCanvas = renderMultiStrokeForTrOCR(strokes, strokeWidth);
         if (trCanvas) {
           const r = await recognizeWithTrOcrWorker(trCanvas);
-          if (r.text.length > 0) { results.push(r); }
+          console.log(`[AI] TrOCR multi: "${r.text}" conf=${r.confidence}`);
+          if (r.text.length > 0 && !isGarbageText(r.text)) { results.push(r); }
         }
       })()
-    : Promise.resolve();
+    : (() => {
+        console.log("[AI] TrOCR not ready, skipping");
+        return Promise.resolve();
+      })();
 
   const tessPromise = (async () => {
     const tessCanvas = renderMultiStrokeForTesseract(strokes, strokeWidth);

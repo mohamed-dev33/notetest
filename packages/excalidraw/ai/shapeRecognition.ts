@@ -851,7 +851,7 @@ function detectArrow(
 
   // Method 1: Shaft+head split — scan for a straight shaft with non-straight tail
   const tryDirection = (pts: Point[], reverse: boolean): RecognizedShape | null => {
-    for (const shaftFrac of [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]) {
+    for (const shaftFrac of [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]) {
       const shaftEnd = Math.floor(pts.length * shaftFrac);
       if (shaftEnd < 3 || pts.length - shaftEnd < 3) { continue; }
 
@@ -860,21 +860,23 @@ function detectArrow(
       const shaftDirect = dist(pts[0], pts[shaftEnd]);
       const shaftStraight = shaftLen > 0 ? shaftDirect / shaftLen : 0;
 
-      if (shaftStraight > 0.72) {
+      if (shaftStraight > 0.65) {
         const tailPts = pts.slice(shaftEnd);
         const tailDirect = dist(tailPts[0], tailPts[tailPts.length - 1]);
         const tailLen = pathLength(tailPts);
         const tailStraight = tailLen > 0 ? tailDirect / tailLen : 1;
 
-        if (tailStraight < 0.82 && tailLen > totalLen * 0.04) {
+        // Tail should be non-straight (arrowhead bends) and at least 3% of total
+        if (tailStraight < 0.85 && tailLen > totalLen * 0.03) {
           const startPt = reverse ? points[points.length - 1] : points[0];
           const endPt = reverse
             ? points[points.length - 1 - shaftEnd]
             : points[shaftEnd];
 
+          const conf = Math.min(1, shaftStraight * 0.95 + (1 - tailStraight) * 0.1);
           return {
             type: "arrow",
-            confidence: Math.min(1, shaftStraight * 0.95),
+            confidence: conf,
             bounds: makeBounds(),
             startPoint: { x: elementX + startPt.x, y: elementY + startPt.y },
             endPoint: { x: elementX + endPt.x, y: elementY + endPt.y },
@@ -891,12 +893,65 @@ function detectArrow(
   const rev = tryDirection([...points].reverse(), true);
   if (rev) { return rev; }
 
-  // Method 2: Elongated shape with sharp angle change — likely arrow even if V curls back
-  // An arrow's bounding box is typically much wider than tall (or much taller than wide)
+  // Method 2: Detect sharp angle change in last/first portion of stroke
+  // People often draw: straight shaft → sharp V for arrowhead
+  const trySharpAngle = (pts: Point[], reverse: boolean): RecognizedShape | null => {
+    if (pts.length < 8) { return null; }
+
+    // Look at the last 40% for a sharp direction change
+    const checkStart = Math.floor(pts.length * 0.5);
+    let maxAngleChange = 0;
+    let maxAngleIdx = -1;
+
+    for (let i = checkStart + 2; i < pts.length - 2; i++) {
+      const dx1 = pts[i].x - pts[i - 2].x;
+      const dy1 = pts[i].y - pts[i - 2].y;
+      const dx2 = pts[i + 2].x - pts[i].x;
+      const dy2 = pts[i + 2].y - pts[i].y;
+      const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
+      const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
+      if (len1 < 1 || len2 < 1) { continue; }
+      const dot = (dx1 * dx2 + dy1 * dy2) / (len1 * len2);
+      const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+      if (angle > maxAngleChange) {
+        maxAngleChange = angle;
+        maxAngleIdx = i;
+      }
+    }
+
+    // Sharp angle (> 60°) in the last portion indicates arrowhead
+    if (maxAngleChange > Math.PI / 3 && maxAngleIdx > 0) {
+      // Check shaft straightness up to the angle change
+      const shaftPts = pts.slice(0, maxAngleIdx + 1);
+      const shaftDirect = dist(shaftPts[0], shaftPts[shaftPts.length - 1]);
+      const shaftLen = pathLength(shaftPts);
+      const shaftStraight = shaftLen > 0 ? shaftDirect / shaftLen : 0;
+
+      if (shaftStraight > 0.60) {
+        const startPt = reverse ? points[points.length - 1] : points[0];
+        const endIdx = reverse ? points.length - 1 - maxAngleIdx : maxAngleIdx;
+        const endPt = points[endIdx];
+
+        return {
+          type: "arrow",
+          confidence: Math.min(1, shaftStraight * 0.85 + maxAngleChange / Math.PI * 0.15),
+          bounds: makeBounds(),
+          startPoint: { x: elementX + startPt.x, y: elementY + startPt.y },
+          endPoint: { x: elementX + endPt.x, y: elementY + endPt.y },
+        };
+      }
+    }
+    return null;
+  };
+
+  const sharp = trySharpAngle(points, false);
+  if (sharp) { return sharp; }
+  const sharpRev = trySharpAngle([...points].reverse(), true);
+  if (sharpRev) { return sharpRev; }
+
+  // Method 3: Elongated shape with directional flow
   const elongation = Math.max(bounds.width, bounds.height) / Math.max(Math.min(bounds.width, bounds.height), 1);
   if (elongation > 2.5 && points.length >= 8) {
-    // Check if majority of path is straight (80%+ of points along a main axis)
-    // Compute principal direction via first and last 25% of points
     const q1End = Math.floor(points.length * 0.25);
     const q3Start = Math.floor(points.length * 0.75);
     const startCenter = {
@@ -911,7 +966,6 @@ function detectArrow(
     const mainAxisRatio = mainAxisDist / totalLen;
 
     if (mainAxisRatio > 0.30) {
-      // Elongated with directional flow → likely arrow
       return {
         type: "arrow",
         confidence: Math.min(1, mainAxisRatio * 1.2),

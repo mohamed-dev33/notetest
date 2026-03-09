@@ -1187,7 +1187,7 @@ export const ShapesSwitcher = ({
           <ToolButton
             type="icon"
             icon={<span style={{ fontSize: 16 }}>🔷</span>}
-            title="AI Shape Recognition"
+            title={`AI Shape Recognition (${app.state.aiShapeRecognitionEnabled ? "ON" : "OFF"})`}
             aria-label="AI Shape Recognition"
             className={clsx("Shape", {
               fillable: app.state.aiShapeRecognitionEnabled,
@@ -1203,7 +1203,7 @@ export const ShapesSwitcher = ({
           <ToolButton
             type="icon"
             icon={<span style={{ fontSize: 16 }}>✍️</span>}
-            title="AI Handwriting Recognition"
+            title={`AI Handwriting Recognition (${app.state.aiHandwritingRecognitionEnabled ? "ON" : "OFF"})`}
             aria-label="AI Handwriting Recognition"
             className={clsx("Shape", {
               fillable: app.state.aiHandwritingRecognitionEnabled,
