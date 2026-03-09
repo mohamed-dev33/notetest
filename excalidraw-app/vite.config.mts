@@ -15,8 +15,13 @@ export default defineConfig(({ mode }) => {
   return {
     server: {
       port: Number(envVars.VITE_APP_PORT || 3000),
-      // open the browser
-      open: true,
+      // Bind to all interfaces so Cloudflare tunnel / reverse proxy can reach it
+      host: "0.0.0.0",
+      // Allow any hostname (needed for Cloudflare tunnel domains)
+      allowedHosts: "all",
+    },
+    worker: {
+      format: "es",
     },
     // We need to specify the envDir since now there are no
     //more located in parallel with the vite.config.ts file but in parent dir

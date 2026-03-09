@@ -187,7 +187,6 @@ async function recognizeArabicWithNativeAPI(
     if (predictions.length > 0 && predictions[0].text.length > 0) {
       const text = cleanArabicOcrText(predictions[0].text);
       if (text.length > 0 && !isArabicGarbageText(text)) {
-        console.log(`[AI] Native Arabic HWR: "${text}" (top prediction)`);
         return { text, confidence: 85 };
       }
     }
@@ -243,7 +242,6 @@ async function recognizeArabicMultiStrokeNativeAPI(
     if (predictions.length > 0 && predictions[0].text.length > 0) {
       const text = cleanArabicOcrText(predictions[0].text);
       if (text.length > 0 && !isArabicGarbageText(text)) {
-        console.log(`[AI] Native Arabic HWR multi-stroke: "${text}"`);
         return { text, confidence: 85 };
       }
     }
@@ -295,7 +293,6 @@ async function recognizeWithNativeAPI(
     if (predictions.length > 0 && predictions[0].text.length > 0) {
       const text = cleanOcrText(predictions[0].text);
       if (text.length > 0 && !isGarbageText(text)) {
-        console.log(`[AI] Native HWR: "${text}" (top prediction)`);
         return { text, confidence: 85 };
       }
     }
@@ -351,7 +348,6 @@ async function recognizeMultiStrokeNativeAPI(
     if (predictions.length > 0 && predictions[0].text.length > 0) {
       const text = cleanOcrText(predictions[0].text);
       if (text.length > 0 && !isGarbageText(text)) {
-        console.log(`[AI] Native HWR multi-stroke: "${text}"`);
         return { text, confidence: 85 };
       }
     }
@@ -541,7 +537,7 @@ function renderForTrOCR(
 /**
  * Render points for Tesseract — high-contrast at optimal resolution.
  * Key insights for Tesseract accuracy:
- * - Tesseract works best at ~300 DPI equivalent (~120px text height)
+ * - Tesseract works best at ~300 DPI equivalent (~160px text height)
  * - Stroke width should be proportional (~8-12% of text height)
  * - Pressure simulation makes mouse strokes look like pen strokes
  * - Slight blur softens jagged edges from mouse input
@@ -565,16 +561,16 @@ function renderForTesseract(
   const rawH = maxY - minY;
   if (rawW < 3 && rawH < 3) { return null; }
 
-  // Higher resolution: 120px text height (optimal for Tesseract at ~300 DPI)
-  const targetH = 120;
-  const padding = 24;
-  const scale = Math.max(1.5, targetH / Math.max(rawH, 1));
+  // Higher resolution: 160px text height (optimal for Tesseract at ~300 DPI)
+  const targetH = 160;
+  const padding = 32;
+  const scale = Math.max(2.0, targetH / Math.max(rawH, 1));
   const canvasW = Math.ceil(rawW * scale + padding * 2);
   const canvasH = Math.ceil(rawH * scale + padding * 2);
 
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(canvasW, 100);
-  canvas.height = Math.max(canvasH, 100);
+  canvas.width = Math.max(canvasW, 120);
+  canvas.height = Math.max(canvasH, 120);
 
   const ctx = canvas.getContext("2d")!;
   if (!ctx) { return null; }
@@ -583,7 +579,7 @@ function renderForTesseract(
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   // Stroke width: ~10% of target height
-  const baseStrokeW = Math.max(2, Math.min(14, targetH * 0.10));
+  const baseStrokeW = Math.max(3, Math.min(16, targetH * 0.10));
 
   // Pressure-variable rendering for natural look
   const widths = computePressureWidths(points, baseStrokeW, 0.6, 1.4);
@@ -695,15 +691,15 @@ function renderMultiStrokeForTesseract(
   const rawH = maxY - minY;
   if (rawW < 3 && rawH < 3) { return null; }
 
-  const targetH = 120;
-  const padding = 24;
-  const scale = Math.max(1.5, targetH / Math.max(rawH, 1));
+  const targetH = 160;
+  const padding = 32;
+  const scale = Math.max(2.0, targetH / Math.max(rawH, 1));
   const canvasW = Math.ceil(rawW * scale + padding * 2);
   const canvasH = Math.ceil(rawH * scale + padding * 2);
 
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(canvasW, 100);
-  canvas.height = Math.max(canvasH, 100);
+  canvas.width = Math.max(canvasW, 120);
+  canvas.height = Math.max(canvasH, 120);
 
   const ctx = canvas.getContext("2d")!;
   if (!ctx) { return null; }
@@ -711,7 +707,7 @@ function renderMultiStrokeForTesseract(
   ctx.fillStyle = "#FFFFFF";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  const baseStrokeW = Math.max(2, Math.min(14, targetH * 0.10));
+  const baseStrokeW = Math.max(3, Math.min(16, targetH * 0.10));
   ctx.fillStyle = "#000000";
   ctx.strokeStyle = "#000000";
   ctx.lineCap = "round";
@@ -885,42 +881,47 @@ async function recognizeWithTesseract(
     const worker = await ensureTesseract();
     if (!worker) { return noResult; }
 
-    // Try PSM 7 (single line) first — best for general handwriting
+    const candidates: HandwritingResult[] = [];
+
+    // PSM 7 (single line) — best for general handwriting
     const { data: data7 } = await worker.recognize(canvas);
     const text7 = cleanOcrText(data7.text);
     const conf7 = data7.confidence;
-    console.log(`[AI] Tesseract PSM7: "${text7}" conf=${conf7}`);
+    if (text7.length > 0 && !isGarbageText(text7) && conf7 >= 12) {
+      candidates.push({ text: text7, confidence: conf7 });
+    }
 
-    // Try PSM 8 (single word) for short inputs
-    let text8 = "";
-    let conf8 = 0;
+    // PSM 8 (single word) for short inputs
     try {
       await worker.setParameters({ tessedit_pageseg_mode: "8" });
       const { data: d8 } = await worker.recognize(canvas);
-      text8 = cleanOcrText(d8.text);
-      conf8 = d8.confidence;
-      console.log(`[AI] Tesseract PSM8: "${text8}" conf=${conf8}`);
-      // Reset to PSM 7
-      await worker.setParameters({ tessedit_pageseg_mode: "7" });
-    } catch { /* PSM 8 failed, continue with PSM 7 result */ }
+      const text8 = cleanOcrText(d8.text);
+      const conf8 = d8.confidence;
+      if (text8.length > 0 && !isGarbageText(text8) && conf8 >= 12) {
+        candidates.push({ text: text8, confidence: conf8 });
+      }
+    } catch { /* PSM 8 failed */ }
 
-    // Pick the best result that isn't garbage
-    const candidates: HandwritingResult[] = [];
+    // PSM 13 (raw line) — sometimes catches what other modes miss
+    try {
+      await worker.setParameters({ tessedit_pageseg_mode: "13" });
+      const { data: d13 } = await worker.recognize(canvas);
+      const text13 = cleanOcrText(d13.text);
+      const conf13 = d13.confidence;
+      if (text13.length > 0 && !isGarbageText(text13) && conf13 >= 12) {
+        candidates.push({ text: text13, confidence: conf13 });
+      }
+    } catch { /* PSM 13 failed */ }
 
-    if (text7.length > 0 && !isGarbageText(text7) && conf7 >= 15) {
-      candidates.push({ text: text7, confidence: conf7 });
-    }
-    if (text8.length > 0 && !isGarbageText(text8) && conf8 >= 15) {
-      candidates.push({ text: text8, confidence: conf8 });
-    }
+    // Reset to PSM 7
+    await worker.setParameters({ tessedit_pageseg_mode: "7" });
 
     if (candidates.length === 0) { return noResult; }
 
-    // Prefer the result with higher confidence, but boost single-word
-    // results that look more like real words
+    // Sort: prefer real words, then highest confidence
     candidates.sort((a, b) => {
-      const scoreA = a.confidence + (isLikelyWord(a.text) ? 10 : 0);
-      const scoreB = b.confidence + (isLikelyWord(b.text) ? 10 : 0);
+      const scoreA = a.confidence + (isLikelyWord(a.text) ? 15 : 0) + a.text.length * 0.5;
+      const scoreB = b.confidence + (isLikelyWord(b.text) ? 15 : 0) + b.text.length * 0.5;
       return scoreB - scoreA;
     });
 
@@ -986,7 +987,6 @@ async function recognizeArabicWithTesseract(
     const { data: data6 } = await worker.recognize(canvas);
     const text6 = cleanArabicOcrText(data6.text);
     const conf6 = data6.confidence;
-    console.log(`[AI] Arabic Tesseract PSM6: "${text6}" conf=${conf6}`);
 
     // PSM 7: single line
     let text7 = "";
@@ -996,7 +996,6 @@ async function recognizeArabicWithTesseract(
       const { data: d7 } = await worker.recognize(canvas);
       text7 = cleanArabicOcrText(d7.text);
       conf7 = d7.confidence;
-      console.log(`[AI] Arabic Tesseract PSM7: "${text7}" conf=${conf7}`);
       await worker.setParameters({ tessedit_pageseg_mode: "6" });
     } catch { /* fallback to PSM 6 result */ }
 
@@ -1008,7 +1007,6 @@ async function recognizeArabicWithTesseract(
       const { data: d8 } = await worker.recognize(canvas);
       text8 = cleanArabicOcrText(d8.text);
       conf8 = d8.confidence;
-      console.log(`[AI] Arabic Tesseract PSM8: "${text8}" conf=${conf8}`);
       await worker.setParameters({ tessedit_pageseg_mode: "6" });
     } catch { /* fallback */ }
 
@@ -1044,7 +1042,7 @@ async function recognizeArabicWithTesseract(
 
 /** Clean common OCR artifacts from text */
 function cleanOcrText(raw: string): string {
-  return raw
+  let text = raw
     .trim()
     .replace(/\n+/g, " ")
     .replace(/[|]/g, "l")
@@ -1052,6 +1050,18 @@ function cleanOcrText(raw: string): string {
     .replace(/[_~^`]/g, "")
     .replace(/\s{2,}/g, " ")
     .trim();
+
+  // Fix common OCR confusions
+  text = text
+    .replace(/0(?=[a-zA-Z])/g, "O") // 0 before letters → O
+    .replace(/(?<=[a-zA-Z])0/g, "o") // 0 after letters → o
+    .replace(/1(?=[a-zA-Z]{2,})/g, "l") // 1 before 2+ letters → l
+    .replace(/(?<=[a-zA-Z]{2,})1/g, "l") // 1 after 2+ letters → l
+    .replace(/\$/g, "S") // $ → S
+    .replace(/€/g, "E") // € → E
+    .replace(/@(?=[a-zA-Z])/g, "a"); // @ before letters → a
+
+  return text;
 }
 
 /** Check if text looks like a real word (has vowels, reasonable structure) */
@@ -1229,7 +1239,6 @@ export async function recognizeHandwriting(
         const trCanvas = renderForTrOCR(points, strokeWidth);
         if (trCanvas) {
           const r = await recognizeWithTrOcrWorker(trCanvas);
-          console.log(`[AI] TrOCR single: "${r.text}" conf=${r.confidence}`);
           if (r.text.length > 0 && !isGarbageText(r.text)) { results.push(r); }
         }
       })()
@@ -1247,13 +1256,12 @@ export async function recognizeHandwriting(
   await Promise.all([nativePromise, trOcrPromise, tessPromise]);
 
   if (results.length > 0) {
-    // Sort by confidence, boost results that look like real words
     results.sort((a, b) => {
-      const scoreA = a.confidence + (isLikelyWord(a.text) ? 8 : 0);
-      const scoreB = b.confidence + (isLikelyWord(b.text) ? 8 : 0);
+      const scoreA = a.confidence + (isLikelyWord(a.text) ? 12 : 0) + a.text.length * 0.5;
+      const scoreB = b.confidence + (isLikelyWord(b.text) ? 12 : 0) + b.text.length * 0.5;
       return scoreB - scoreA;
     });
-    if (results[0].confidence >= 20) {
+    if (results[0].confidence >= 15) {
       return results[0];
     }
   }
@@ -1287,12 +1295,10 @@ export async function recognizeHandwritingMultiStroke(
         const trCanvas = renderMultiStrokeForTrOCR(strokes, strokeWidth);
         if (trCanvas) {
           const r = await recognizeWithTrOcrWorker(trCanvas);
-          console.log(`[AI] TrOCR multi: "${r.text}" conf=${r.confidence}`);
           if (r.text.length > 0 && !isGarbageText(r.text)) { results.push(r); }
         }
       })()
     : (() => {
-        console.log("[AI] TrOCR not ready, skipping");
         return Promise.resolve();
       })();
 
@@ -1309,11 +1315,11 @@ export async function recognizeHandwritingMultiStroke(
 
   if (results.length > 0) {
     results.sort((a, b) => {
-      const scoreA = a.confidence + (isLikelyWord(a.text) ? 8 : 0);
-      const scoreB = b.confidence + (isLikelyWord(b.text) ? 8 : 0);
+      const scoreA = a.confidence + (isLikelyWord(a.text) ? 12 : 0) + a.text.length * 0.5;
+      const scoreB = b.confidence + (isLikelyWord(b.text) ? 12 : 0) + b.text.length * 0.5;
       return scoreB - scoreA;
     });
-    if (results[0].confidence >= 20) {
+    if (results[0].confidence >= 15) {
       return results[0];
     }
   }

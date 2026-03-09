@@ -645,7 +645,8 @@ class App extends React.Component<AppProps, AppState> {
   // AI Recognition debounce — wait for user to finish drawing before recognizing
   private aiRecognitionTimer: ReturnType<typeof setTimeout> | null = null;
   private aiPendingElements: ExcalidrawFreeDrawElement[] = [];
-  private static readonly AI_RECOGNITION_DELAY_MS = 1500;
+  private aiLastStrokeTime: number = 0;
+  private aiStrokeIntervals: number[] = [];
   // When true, clicking on empty canvas returns to freedraw (set after shape recognition)
   private aiReturnToFreedraw = false;
 
@@ -8572,24 +8573,56 @@ class App extends React.Component<AppProps, AppState> {
    * longer when handwriting is enabled (need to finish writing).
    */
   private queueAIRecognition = (element: ExcalidrawFreeDrawElement) => {
+    const now = Date.now();
+
+    // Track inter-stroke intervals to learn writing speed
+    if (this.aiLastStrokeTime > 0 && this.aiPendingElements.length > 0) {
+      const gap = now - this.aiLastStrokeTime;
+      // Only track reasonable gaps (50ms-5s) — ignore very short or long pauses
+      if (gap >= 50 && gap <= 5000) {
+        this.aiStrokeIntervals.push(gap);
+        // Keep last 10 intervals to adapt to current writing pace
+        if (this.aiStrokeIntervals.length > 10) {
+          this.aiStrokeIntervals.shift();
+        }
+      }
+    }
+    this.aiLastStrokeTime = now;
+
     this.aiPendingElements.push(element);
 
     if (this.aiRecognitionTimer) {
       clearTimeout(this.aiRecognitionTimer);
     }
 
-    // Longer delay when handwriting is enabled so user can finish words
-    const delay = (this.state.aiHandwritingRecognitionEnabled || this.state.aiArabicHandwritingEnabled)
-      ? 2000
-      : 800;
+    const isHandwriting = this.state.aiHandwritingRecognitionEnabled || this.state.aiArabicHandwritingEnabled;
+
+    // Compute adaptive delay based on writing speed
+    let delay: number;
+    if (!isHandwriting) {
+      // Shape recognition: short fixed delay
+      delay = 800;
+    } else if (this.aiStrokeIntervals.length >= 2) {
+      // Adaptive: wait 2.5x the average inter-stroke gap (clamped 1.5s-5s)
+      // This means if user writes chars every 400ms, we wait 1.5s after last stroke
+      // If user writes slowly (1s between strokes), we wait 2.5s
+      const avg = this.aiStrokeIntervals.reduce((a, b) => a + b, 0) / this.aiStrokeIntervals.length;
+      delay = Math.max(1500, Math.min(5000, avg * 2.5));
+    } else {
+      // Not enough data yet — use generous default for first word
+      delay = 3000;
+    }
 
     this.setToast({
-      message: "🔍 AI recognition waiting...",
+      message: `🔍 AI waiting for you to finish${isHandwriting ? " writing" : ""}...`,
       closable: false,
       duration: delay + 500,
     });
 
     this.aiRecognitionTimer = setTimeout(() => {
+      // Reset stroke tracking for next recognition cycle
+      this.aiStrokeIntervals = [];
+      this.aiLastStrokeTime = 0;
       this.processAIRecognitionBatch();
     }, delay);
   };
@@ -8689,11 +8722,12 @@ class App extends React.Component<AppProps, AppState> {
           position: { x: screenX, y: screenY },
           onAccept: () => {
             if (result.type === "shape" && result.shape) {
+              // applyShapeRecognition clears aiRecognitionPending itself
               this.applyShapeRecognition(result.shape, consumed);
             } else if (result.type === "text" && result.handwriting) {
               this.applyHandwritingRecognition(result.handwriting, consumed);
+              this.setState({ aiRecognitionPending: null });
             }
-            this.setState({ aiRecognitionPending: null });
           },
           onReject: () => {
             this.setState({ aiRecognitionPending: null });
@@ -8843,13 +8877,25 @@ class App extends React.Component<AppProps, AppState> {
 
     this.scene.insertElement(replacementElement);
 
-    // Switch to selection tool so user can control the shape's properties.
-    // Set flag to return to freedraw on next click in empty area.
-    this.setActiveTool({ type: "selection" });
-    this.aiReturnToFreedraw = true;
-    this.setState({
-      selectedElementIds: { [replacementElement.id]: true },
-    });
+    const isLineOrArrow = shape.type === "line" || shape.type === "arrow";
+
+    // Lines/arrows: stay in freedraw, never auto-select.
+    // Other shapes: switch to selection only if aiAutoSelectAfterRecognize is on,
+    // so the user can immediately adjust width/height/properties.
+    if (!isLineOrArrow && this.state.aiAutoSelectAfterRecognize) {
+      this.setActiveTool({ type: "selection" });
+      this.aiReturnToFreedraw = true;
+      // Use requestAnimationFrame to ensure the element is rendered before selecting,
+      // so the properties panel shows immediately.
+      requestAnimationFrame(() => {
+        this.setState({
+          selectedElementIds: { [replacementElement.id]: true },
+          aiRecognitionPending: null,
+        });
+      });
+    } else {
+      this.setState({ aiRecognitionPending: null });
+    }
 
     this.setToast({
       message: `✨ Recognized: ${shape.type} (${Math.round(shape.confidence * 100)}%)`,

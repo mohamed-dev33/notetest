@@ -269,7 +269,6 @@ export async function processFreedrawBatch(
   // --- Analyze multi-stroke pattern ---
   const strokesLikeSeparateChars = checkStrokesAreSeparateChars(elements);
   const strokesFormOneShape = !strokesLikeSeparateChars && checkStrokesFormOneShape(elements);
-  console.log(`[AI] Multi-stroke: ${elements.length} strokes, separateChars=${strokesLikeSeparateChars}, oneShape=${strokesFormOneShape}`);
 
   // --- Run both in parallel ---
   let shapeResult: RecognizedShape | null = null;

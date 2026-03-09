@@ -1260,26 +1260,44 @@ export const ShapesSwitcher = ({
           {(app.state.aiShapeRecognitionEnabled ||
             app.state.aiHandwritingRecognitionEnabled ||
             app.state.aiArabicHandwritingEnabled) && (
-            <ToolButton
-              type="icon"
-              icon={<span style={{ fontSize: 16 }}>⏹️</span>}
-              title="Stop AI Recognition"
-              aria-label="Stop AI Recognition"
-              className="Shape"
-              data-testid="toolbar-ai-stop"
-              onClick={() => {
-                setAppState({
-                  aiShapeRecognitionEnabled: false,
-                  aiHandwritingRecognitionEnabled: false,
-                  aiArabicHandwritingEnabled: false,
-                  aiRecognitionPending: null,
-                } as any);
-                import("../ai").then(({ terminateHandwritingEngine, terminateArabicHandwritingEngine }) => {
-                  terminateHandwritingEngine();
-                  terminateArabicHandwritingEngine();
-                });
-              }}
-            />
+            <>
+              <ToolButton
+                type="icon"
+                icon={<span style={{ fontSize: 14 }}>🎯</span>}
+                title={`Auto-select after recognize (${app.state.aiAutoSelectAfterRecognize ? "ON" : "OFF"})`}
+                aria-label="Auto-select shape after recognition"
+                className={clsx("Shape", {
+                  fillable: app.state.aiAutoSelectAfterRecognize,
+                })}
+                data-testid="toolbar-ai-autoselect"
+                selected={app.state.aiAutoSelectAfterRecognize}
+                onClick={() => {
+                  setAppState({
+                    aiAutoSelectAfterRecognize: !app.state.aiAutoSelectAfterRecognize,
+                  } as any);
+                }}
+              />
+              <ToolButton
+                type="icon"
+                icon={<span style={{ fontSize: 16 }}>⏹️</span>}
+                title="Stop AI Recognition"
+                aria-label="Stop AI Recognition"
+                className="Shape"
+                data-testid="toolbar-ai-stop"
+                onClick={() => {
+                  setAppState({
+                    aiShapeRecognitionEnabled: false,
+                    aiHandwritingRecognitionEnabled: false,
+                    aiArabicHandwritingEnabled: false,
+                    aiRecognitionPending: null,
+                  } as any);
+                  import("../ai").then(({ terminateHandwritingEngine, terminateArabicHandwritingEngine }) => {
+                    terminateHandwritingEngine();
+                    terminateArabicHandwritingEngine();
+                  });
+                }}
+              />
+            </>
           )}
           <div className="App-toolbar__divider" />
         </>

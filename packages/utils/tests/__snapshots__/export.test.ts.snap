@@ -12,6 +12,7 @@ exports[`exportToSvg > with default arguments 1`] = `
     "type": "selection",
   },
   "aiArabicHandwritingEnabled": false,
+  "aiAutoSelectAfterRecognize": true,
   "aiHandwritingRecognitionEnabled": false,
   "aiRecognitionPending": null,
   "aiShapeRecognitionEnabled": false,

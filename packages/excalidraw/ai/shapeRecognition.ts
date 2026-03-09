@@ -686,6 +686,61 @@ function perimeterDiameterRatio(pts: Point[], bounds: { width: number; height: n
 }
 
 /**
+ * Classify detected corners as near bounding-box corners (rectangle-like)
+ * vs near bounding-box edge midpoints (diamond-like).
+ *
+ * Returns a score from -1 (strongly diamond) to +1 (strongly rectangle).
+ * 0 = ambiguous.
+ *
+ * Rectangle corners cluster at (0,0),(1,0),(1,1),(0,1) in normalized bbox.
+ * Diamond corners cluster at (0.5,0),(1,0.5),(0.5,1),(0,0.5) in normalized bbox.
+ */
+function cornerPositionScore(
+  pts: Point[],
+  cornerIndices: number[],
+  bounds: { x: number; y: number; width: number; height: number },
+): number {
+  if (cornerIndices.length < 2 || bounds.width < 1 || bounds.height < 1) {
+    return 0;
+  }
+
+  // Normalize corner positions to [0,1] within bounding box
+  let rectScore = 0;
+  let diamondScore = 0;
+
+  for (const ci of cornerIndices) {
+    const nx = (pts[ci].x - bounds.x) / bounds.width; // 0..1
+    const ny = (pts[ci].y - bounds.y) / bounds.height;
+
+    // Distance to nearest bbox corner (rectangle pattern)
+    const dCorner = Math.min(
+      Math.sqrt(nx * nx + ny * ny), // top-left
+      Math.sqrt((1 - nx) * (1 - nx) + ny * ny), // top-right
+      Math.sqrt((1 - nx) * (1 - nx) + (1 - ny) * (1 - ny)), // bottom-right
+      Math.sqrt(nx * nx + (1 - ny) * (1 - ny)), // bottom-left
+    );
+
+    // Distance to nearest bbox edge midpoint (diamond pattern)
+    const dMid = Math.min(
+      Math.sqrt((0.5 - nx) * (0.5 - nx) + ny * ny), // top-mid
+      Math.sqrt((1 - nx) * (1 - nx) + (0.5 - ny) * (0.5 - ny)), // right-mid
+      Math.sqrt((0.5 - nx) * (0.5 - nx) + (1 - ny) * (1 - ny)), // bottom-mid
+      Math.sqrt(nx * nx + (0.5 - ny) * (0.5 - ny)), // left-mid
+    );
+
+    if (dCorner < dMid) {
+      rectScore += (dMid - dCorner);
+    } else {
+      diamondScore += (dCorner - dMid);
+    }
+  }
+
+  const total = rectScore + diamondScore;
+  if (total < 0.001) { return 0; }
+  return (rectScore - diamondScore) / total; // -1..+1
+}
+
+/**
  * Recognize a shape from freedraw points using a hybrid approach:
  * 1. Geometric analysis (corners, circularity, straightness) — primary
  * 2. Protractor template matching — secondary confirmation
@@ -789,6 +844,7 @@ export function recognizeShape(
   const rightAngleFrac = cornerCount > 0 ? rightAngleFraction(analyzePoints, corners) : 0;
   const curvVar = curvatureVariance(analyzePoints);
   const pdRatio = perimeterDiameterRatio(analyzePoints, bounds);
+  const cpScore = cornerPositionScore(analyzePoints, corners, bounds);
 
   const closedConf = effectivelyClosed ? 1.0 : 0.85;
 
@@ -814,31 +870,34 @@ export function recognizeShape(
   }
 
   // ---- Rectangle detection ----
-  // ~4 corners with right angles, high fill ratio, high convexity
-  // MUST have low circularity (to exclude ellipses) and sharp corners (curvVar > threshold)
+  // Rectangles: corners at bbox corners → cpScore > 0, high fillRatio, right angles
+  // Lower fillRatio threshold to 0.60 to catch hand-drawn rectangles with loose corners
+  // Use cpScore to disambiguate from diamond in the overlap zone
   if (
     cornerCount >= 3 && cornerCount <= 6 &&
-    fillRatio > 0.70 &&
-    convexity > 0.85 &&
-    rightAngleFrac >= 0.5 &&
+    fillRatio > 0.60 &&
+    convexity > 0.82 &&
+    rightAngleFrac >= 0.35 &&
     circ < 0.82 &&
-    aspectRatio > 0.15 && aspectRatio < 6.0
+    aspectRatio > 0.15 && aspectRatio < 6.0 &&
+    cpScore > -0.3 // corners should NOT be at edge midpoints (diamond pattern)
   ) {
-    const conf = Math.min(1, (fillRatio * 0.5 + rightAngleFrac * 0.5) * 1.05 * closedConf);
+    const conf = Math.min(1, (fillRatio * 0.4 + rightAngleFrac * 0.4 + Math.max(0, cpScore) * 0.2) * 1.05 * closedConf);
     return {
       type: "rectangle",
       confidence: conf,
       bounds: makeBounds(),
     };
   }
-  // Relaxed rectangle: good fill ratio but must NOT be smooth (ellipse-like)
+  // Relaxed rectangle: high fill, not smooth, corners near bbox corners
   if (
-    cornerCount >= 3 &&
-    fillRatio > 0.75 &&
-    convexity > 0.88 &&
+    cornerCount >= 2 &&
+    fillRatio > 0.68 &&
+    convexity > 0.85 &&
     circ < 0.80 &&
-    curvVar > 0.03 &&
-    aspectRatio > 0.2 && aspectRatio < 5.0
+    curvVar > 0.02 &&
+    aspectRatio > 0.2 && aspectRatio < 5.0 &&
+    cpScore > -0.2
   ) {
     return {
       type: "rectangle",
@@ -847,53 +906,56 @@ export function recognizeShape(
     };
   }
 
-  // ---- Diamond detection (BEFORE triangle) ----
-  // Diamond: ~4 corners, fill ratio ~0.5 (half of bounding box), near-square aspect
-  // Key distinguisher from rectangle: fillRatio < 0.72 (diamond fills ~50% of bbox)
-  // Note: square-aspect diamonds DO have right angles (rotated square), so we don't
-  // exclude based on rightAngleFrac.  Instead, rely on fillRatio + vertexCount.
+  // ---- Diamond detection ----
+  // Diamond: ~4 vertices, corners at bbox edge midpoints, fillRatio ≈ 0.50
+  // Near-square aspect ratio (rotated square), 4 clear corners
   if (
     cornerCount >= 2 && cornerCount <= 6 &&
-    fillRatio > 0.32 && fillRatio < 0.72 &&
+    fillRatio > 0.30 && fillRatio < 0.68 &&
     convexity > 0.82 &&
     vertexCount >= 4 &&
-    aspectRatio > 0.35 && aspectRatio < 2.8
+    aspectRatio > 0.35 && aspectRatio < 2.8 &&
+    !(rightAngleFrac > 0.5 && fillRatio > 0.55) // not a rectangle
   ) {
+    const cpBonus = Math.max(0, -cpScore) * 0.1;
     return {
       type: "diamond",
-      confidence: Math.min(1, convexity * 0.95 * closedConf),
-      bounds: makeBounds(),
-    };
-  }
-  // Relaxed diamond: fewer constraints
-  if (
-    cornerCount >= 2 && cornerCount <= 6 &&
-    fillRatio > 0.30 && fillRatio < 0.72 &&
-    convexity > 0.80 &&
-    aspectRatio > 0.35 && aspectRatio < 2.8
-  ) {
-    return {
-      type: "diamond",
-      confidence: Math.min(1, convexity * 0.88 * closedConf),
+      confidence: Math.min(1, (convexity * 0.90 + cpBonus) * closedConf),
       bounds: makeBounds(),
     };
   }
 
   // ---- Triangle detection ----
-  // ~3 corners, lower fill ratio (~0.5), NOT elongated (elongated = arrow/line)
-  // Key: 3 vertices in RDP simplification, convex, not too elongated
-  // MUST have fewer vertices than diamond (3 vs 4)
+  // Triangles: ~3 corners, fill ratio ~0.50, NOT elongated
+  // Key distinguisher from diamond: fewer vertices (3 vs 4), lower corner count
   if (
     cornerCount >= 2 && cornerCount <= 4 &&
     fillRatio > 0.25 && fillRatio < 0.68 &&
     convexity > 0.78 &&
     aspectRatio > 0.35 && aspectRatio < 2.5 &&
-    elongationRatio < 2.2 &&
-    vertexCount >= 3 && vertexCount <= 4
+    elongationRatio < 2.5 &&
+    vertexCount >= 3 && vertexCount <= 5
   ) {
+    const triBonus = vertexCount === 3 ? 0.05 : 0;
     return {
       type: "triangle",
-      confidence: Math.min(1, convexity * 0.88 * closedConf),
+      confidence: Math.min(1, (convexity * 0.88 + triBonus) * closedConf),
+      bounds: makeBounds(),
+    };
+  }
+
+  // Relaxed diamond: fewer constraints, catches diamonds with fewer vertices
+  if (
+    cornerCount >= 2 && cornerCount <= 6 &&
+    fillRatio > 0.28 && fillRatio < 0.65 &&
+    convexity > 0.78 &&
+    aspectRatio > 0.35 && aspectRatio < 2.8 &&
+    !(rightAngleFrac > 0.5 && fillRatio > 0.50) &&
+    cpScore < 0.4
+  ) {
+    return {
+      type: "diamond",
+      confidence: Math.min(1, convexity * 0.85 * closedConf),
       bounds: makeBounds(),
     };
   }
@@ -926,7 +988,7 @@ export function recognizeShape(
       }
     }
 
-    // Cross-validate Protractor result with geometric metrics
+    // Cross-validate Protractor result with geometric metrics + corner positions
     if (protoScore >= 0.50) {
       let validated = protoName;
 
@@ -934,22 +996,31 @@ export function recognizeShape(
       if (protoName === "rectangle" && fillRatio < 0.55) {
         validated = fillRatio < 0.40 ? "triangle" : "diamond";
       }
+      // Protractor says rectangle but corners at edge midpoints → diamond
+      else if (protoName === "rectangle" && cpScore < -0.3 && fillRatio < 0.68) {
+        validated = "diamond";
+      }
       // Protractor says ellipse but low circularity → polygon
       else if (protoName === "ellipse" && circ < 0.60) {
-        if (cornerCount >= 3 && fillRatio > 0.65) { validated = "rectangle"; }
+        if (cornerCount >= 3 && fillRatio > 0.60 && cpScore > -0.2) { validated = "rectangle"; }
         else if (cornerCount >= 3 && fillRatio > 0.35) { validated = "diamond"; }
       }
       // Protractor says triangle but high fill → rectangle
-      else if (protoName === "triangle" && fillRatio > 0.75) {
+      else if (protoName === "triangle" && fillRatio > 0.72) {
         validated = "rectangle";
       }
-      // Protractor says diamond but high fill → rectangle
+      // Protractor says diamond but high fill + corners at bbox corners → rectangle
+      else if (protoName === "diamond" && fillRatio > 0.68 && cpScore > 0) {
+        validated = "rectangle";
+      }
       else if (protoName === "diamond" && fillRatio > 0.78) {
         validated = "rectangle";
       }
-      // Additional cross-validation: rectangle needs some right-angle corners
-      if (validated === "rectangle" && rightAngleFrac < 0.25 && cornerCount >= 3) {
-        validated = fillRatio < 0.55 ? "diamond" : validated;
+      // Rectangle needs some right-angle corners — use cpScore as tiebreaker
+      if (validated === "rectangle" && rightAngleFrac < 0.20 && cornerCount >= 3) {
+        if (fillRatio < 0.55 || cpScore < -0.3) {
+          validated = "diamond";
+        }
       }
 
       return {
@@ -963,10 +1034,10 @@ export function recognizeShape(
     if (circ > 0.60 && cornerCount <= 3 && curvVar < 0.18 && (cornerCount <= 1 || rightAngleFrac < 0.5)) {
       return { type: "ellipse", confidence: Math.min(1, circ * 1.05) * closedConf, bounds: makeBounds() };
     }
-    if (fillRatio > 0.72 && rightAngleFrac > 0.3 && circ < 0.80) {
+    if (fillRatio > 0.60 && rightAngleFrac > 0.25 && circ < 0.80 && cpScore > -0.2) {
       return { type: "rectangle", confidence: fillRatio * closedConf, bounds: makeBounds() };
     }
-    if (fillRatio > 0.35 && fillRatio < 0.72 && aspectRatio > 0.5 && aspectRatio < 2.0 && cornerCount >= 3 && vertexCount >= 4) {
+    if (fillRatio > 0.30 && fillRatio < 0.68 && aspectRatio > 0.5 && aspectRatio < 2.0 && cornerCount >= 3 && vertexCount >= 4 && cpScore < 0.3) {
       return { type: "diamond", confidence: Math.max(0.5, fillRatio) * closedConf, bounds: makeBounds() };
     }
     if (fillRatio > 0.25 && cornerCount >= 2 && cornerCount <= 4 && elongationRatio < 2.2 && vertexCount <= 4) {
