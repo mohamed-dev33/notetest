@@ -469,6 +469,7 @@ export interface AppState {
   /** AI recognition features */
   aiShapeRecognitionEnabled: boolean;
   aiHandwritingRecognitionEnabled: boolean;
+  aiArabicHandwritingEnabled: boolean;
   /** Pending AI recognition confirmation — shown as inline popup */
   aiRecognitionPending: {
     type: "shape" | "text";

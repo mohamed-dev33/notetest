@@ -5,8 +5,13 @@
  * Called after a freedraw element is finalized to optionally replace it
  * with a recognized shape or text element.
  *
- * Strategy: run both engines in parallel, pick the best result.
- * For multi-stroke input, prefer handwriting (text is usually multi-stroke).
+ * Strategy:
+ * - Single stroke: shape runs first (fast), line/arrow returns immediately.
+ *   For other shapes, handwriting runs in parallel; best wins.
+ * - Multi-stroke: check if strokes look like separate characters (text)
+ *   vs connected parts of one shape.
+ *   For text-like input, only run handwriting.
+ *   For shape-like input, run both and pick best.
  */
 
 import type { ExcalidrawFreeDrawElement } from "@excalidraw/element/types";
@@ -20,9 +25,13 @@ import {
 import {
   recognizeHandwriting,
   recognizeHandwritingMultiStroke,
+  recognizeArabicHandwriting,
+  recognizeArabicHandwritingMultiStroke,
   looksLikeText,
   preloadHandwritingEngine,
+  preloadArabicHandwritingEngine,
   terminateHandwritingEngine,
+  terminateArabicHandwritingEngine,
   type HandwritingResult,
 } from "./handwritingRecognition";
 
@@ -34,8 +43,8 @@ export interface AIRecognitionResult {
 }
 
 // Higher thresholds = fewer false positives
-const SHAPE_CONFIDENCE_THRESHOLD = 0.70;
-const HANDWRITING_CONFIDENCE_THRESHOLD = 30;
+const SHAPE_CONFIDENCE_THRESHOLD = 0.68;
+const HANDWRITING_CONFIDENCE_THRESHOLD = 25;
 
 /**
  * Process a single freedraw element.
@@ -45,10 +54,11 @@ export async function processFreedrawElement(
   element: ExcalidrawFreeDrawElement,
   shapeRecognitionEnabled: boolean,
   handwritingRecognitionEnabled: boolean,
+  arabicHandwritingEnabled: boolean = false,
 ): Promise<AIRecognitionResult> {
   const noResult: AIRecognitionResult = { type: "none" };
 
-  if (!shapeRecognitionEnabled && !handwritingRecognitionEnabled) {
+  if (!shapeRecognitionEnabled && !handwritingRecognitionEnabled && !arabicHandwritingEnabled) {
     return noResult;
   }
 
@@ -58,59 +68,70 @@ export async function processFreedrawElement(
     return noResult;
   }
 
-  // Run both in parallel
+  // Run shape recognition first (synchronous, fast)
   let shapeResult: RecognizedShape | null = null;
-  let hwResult: HandwritingResult | null = null;
 
-  const shapePromise = shapeRecognitionEnabled
-    ? Promise.resolve().then(() => {
-        shapeResult = recognizeShape(points, element.x, element.y);
-      })
-    : Promise.resolve();
-
-  // For line/arrow: shape recognition is instant and reliable — return immediately
-  // without waiting for slow handwriting OCR
-  await shapePromise;
-
-  const quickShape = shapeResult as RecognizedShape | null;
-  if (
-    quickShape &&
-    (quickShape.type === "line" || quickShape.type === "arrow") &&
-    quickShape.confidence >= SHAPE_CONFIDENCE_THRESHOLD
-  ) {
-    return { type: "shape", shape: quickShape, consumedElements: [element] };
+  if (shapeRecognitionEnabled) {
+    shapeResult = recognizeShape(points, element.x, element.y);
+    if (shapeResult.type === "freedraw" || shapeResult.confidence < SHAPE_CONFIDENCE_THRESHOLD) {
+      shapeResult = null;
+    }
   }
 
-  const hwPromise = handwritingRecognitionEnabled
-    ? recognizeHandwriting(points, element.strokeWidth, true).then((r) => {
-        if (r.text.length > 0 && r.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD) {
-          hwResult = r;
-        }
-      })
-    : Promise.resolve();
+  // Line/arrow: return immediately without waiting for slow handwriting OCR
+  if (
+    shapeResult &&
+    (shapeResult.type === "line" || shapeResult.type === "arrow") &&
+    shapeResult.confidence >= SHAPE_CONFIDENCE_THRESHOLD
+  ) {
+    return { type: "shape", shape: shapeResult, consumedElements: [element] };
+  }
 
-  await hwPromise;
+  // High-confidence closed shape (≥ 88%): return without handwriting
+  if (shapeResult && shapeResult.confidence >= 0.88) {
+    return { type: "shape", shape: shapeResult, consumedElements: [element] };
+  }
 
-  const sr = shapeResult as RecognizedShape | null;
-  const hr = hwResult as HandwritingResult | null;
+  // Run handwriting recognition (async, slower)
+  let hwResult: HandwritingResult | null = null;
 
-  const shapeValid =
-    sr !== null &&
-    sr.type !== "freedraw" &&
-    sr.confidence >= SHAPE_CONFIDENCE_THRESHOLD;
+  if (handwritingRecognitionEnabled) {
+    const r = await recognizeHandwriting(points, element.strokeWidth, true);
+    if (r.text.length > 0 && r.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD) {
+      hwResult = r;
+    }
+  }
 
-  // If we have both, compare quality
-  if (shapeValid && hr) {
-    if (sr!.confidence >= 0.85) {
-      return { type: "shape", shape: sr!, consumedElements: [element] };
+  // Run Arabic handwriting recognition
+  if (arabicHandwritingEnabled) {
+    const r = await recognizeArabicHandwriting(points, element.strokeWidth);
+    if (r.text.length > 0 && r.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD) {
+      // Prefer Arabic result if it has Arabic characters
+      if (!hwResult || r.confidence >= hwResult.confidence) {
+        hwResult = r;
+      }
+    }
+  }
+
+  // Decision logic: pick the best result
+  const sr = shapeResult;
+  const hr = hwResult;
+
+  if (sr && hr) {
+    if (sr.confidence >= 0.85) {
+      return { type: "shape", shape: sr, consumedElements: [element] };
     }
     if (looksLikeText(points)) {
       return { type: "text", handwriting: hr, consumedElements: [element] };
     }
+    if (sr.confidence * 100 > hr.confidence) {
+      return { type: "shape", shape: sr, consumedElements: [element] };
+    }
+    return { type: "text", handwriting: hr, consumedElements: [element] };
   }
 
-  if (shapeValid) {
-    return { type: "shape", shape: sr!, consumedElements: [element] };
+  if (sr) {
+    return { type: "shape", shape: sr, consumedElements: [element] };
   }
 
   if (hr) {
@@ -124,16 +145,15 @@ export async function processFreedrawElement(
  * Check if a set of strokes look like separate characters (text)
  * vs parts of a single connected shape.
  *
- * Text strokes tend to have clear horizontal separation and similar heights.
- * Shape strokes tend to overlap or connect.
+ * Text strokes: similar heights, horizontally separated, on same baseline.
+ * Shape strokes: overlap, connect, or form a single larger pattern.
  */
 function checkStrokesAreSeparateChars(
   elements: ExcalidrawFreeDrawElement[],
 ): boolean {
   if (elements.length < 2) { return false; }
-  if (elements.length > 20) { return false; }
+  if (elements.length > 25) { return false; }
 
-  // Get bounding box of each stroke
   const boxes = elements.map((el) => {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const p of el.points as readonly LocalPoint[]) {
@@ -142,42 +162,94 @@ function checkStrokesAreSeparateChars(
       maxX = Math.max(maxX, el.x + p[0]);
       maxY = Math.max(maxY, el.y + p[1]);
     }
-    return { minX, minY, maxX, maxY };
+    return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY };
   });
 
-  // Check if strokes have similar vertical extent (like text on a line)
   const allMinY = Math.min(...boxes.map((b) => b.minY));
   const allMaxY = Math.max(...boxes.map((b) => b.maxY));
   const totalHeight = allMaxY - allMinY;
 
   if (totalHeight < 5) { return false; }
 
-  // Count strokes with similar vertical position (on same "text line")
+  // Count strokes sharing a similar vertical baseline
   let sameLineCount = 0;
   for (const box of boxes) {
     const vertOverlap = (Math.min(allMaxY, box.maxY) - Math.max(allMinY, box.minY)) / totalHeight;
-    const strokeH = box.maxY - box.minY;
-    if (vertOverlap > 0.3 || strokeH < totalHeight * 0.3) {
+    if (vertOverlap > 0.3 || box.h < totalHeight * 0.3) {
       sameLineCount++;
     }
   }
 
-  // If most strokes share a similar vertical baseline, it's likely text
-  return sameLineCount >= elements.length * 0.7;
+  // Check horizontal separation — text characters don't heavily overlap
+  const sortedByX = [...boxes].sort((a, b) => a.minX - b.minX);
+  let overlapCount = 0;
+  for (let i = 1; i < sortedByX.length; i++) {
+    const prevRight = sortedByX[i - 1].maxX;
+    const currLeft = sortedByX[i].minX;
+    const overlapFrac = (prevRight - currLeft) / Math.max(sortedByX[i].w, 1);
+    if (overlapFrac > 0.5) { overlapCount++; }
+  }
+
+  // Text: most strokes on same line, limited horizontal overlap
+  const sameLineFrac = sameLineCount / elements.length;
+  const overlapFrac = overlapCount / Math.max(elements.length - 1, 1);
+
+  return sameLineFrac >= 0.6 && overlapFrac < 0.4;
+}
+
+/**
+ * Check if multi-stroke input forms a single shape (e.g., arrow = shaft + head).
+ * Analyzes spatial connectivity between strokes.
+ */
+function checkStrokesFormOneShape(
+  elements: ExcalidrawFreeDrawElement[],
+): boolean {
+  if (elements.length < 2 || elements.length > 5) { return false; }
+
+  // Get start/end points of each stroke
+  const strokeEnds = elements.map((el) => {
+    const pts = el.points as readonly LocalPoint[];
+    return {
+      start: { x: el.x + pts[0][0], y: el.y + pts[0][1] },
+      end: { x: el.x + pts[pts.length - 1][0], y: el.y + pts[pts.length - 1][1] },
+    };
+  });
+
+  // Check if strokes connect — an end of one is near a start/end of another
+  let connectionCount = 0;
+  const threshold = 30; // pixels
+
+  for (let i = 0; i < strokeEnds.length; i++) {
+    for (let j = i + 1; j < strokeEnds.length; j++) {
+      const distances = [
+        Math.hypot(strokeEnds[i].end.x - strokeEnds[j].start.x, strokeEnds[i].end.y - strokeEnds[j].start.y),
+        Math.hypot(strokeEnds[i].end.x - strokeEnds[j].end.x, strokeEnds[i].end.y - strokeEnds[j].end.y),
+        Math.hypot(strokeEnds[i].start.x - strokeEnds[j].start.x, strokeEnds[i].start.y - strokeEnds[j].start.y),
+        Math.hypot(strokeEnds[i].start.x - strokeEnds[j].end.x, strokeEnds[i].start.y - strokeEnds[j].end.y),
+      ];
+      if (Math.min(...distances) < threshold) {
+        connectionCount++;
+      }
+    }
+  }
+
+  // At least one connection between strokes
+  return connectionCount > 0;
 }
 
 /**
  * Process a batch of freedraw elements drawn in quick succession.
  *
  * For multi-stroke input:
- * - Run handwriting recognition (multi-stroke text is common)
- * - Run shape recognition on combined points
- * - Pick the best result
+ * - If strokes look like separate characters → handwriting recognition
+ * - If strokes form one connected shape → shape recognition on combined points
+ * - Otherwise → run both and pick best
  */
 export async function processFreedrawBatch(
   elements: ExcalidrawFreeDrawElement[],
   shapeRecognitionEnabled: boolean,
   handwritingRecognitionEnabled: boolean,
+  arabicHandwritingEnabled: boolean = false,
 ): Promise<AIRecognitionResult> {
   const noResult: AIRecognitionResult = { type: "none" };
 
@@ -185,25 +257,25 @@ export async function processFreedrawBatch(
     return noResult;
   }
 
-  // Single element — delegate
   if (elements.length === 1) {
     return processFreedrawElement(
       elements[0],
       shapeRecognitionEnabled,
       handwritingRecognitionEnabled,
+      arabicHandwritingEnabled,
     );
   }
 
-  // --- Run both in parallel for multi-stroke ---
+  // --- Analyze multi-stroke pattern ---
+  const strokesLikeSeparateChars = checkStrokesAreSeparateChars(elements);
+  const strokesFormOneShape = !strokesLikeSeparateChars && checkStrokesFormOneShape(elements);
+  console.log(`[AI] Multi-stroke: ${elements.length} strokes, separateChars=${strokesLikeSeparateChars}, oneShape=${strokesFormOneShape}`);
+
+  // --- Run both in parallel ---
   let shapeResult: RecognizedShape | null = null;
   let hwResult: HandwritingResult | null = null;
 
-  // Heuristic: check if strokes look like separate characters (text)
-  // vs a single connected drawing (shape)
-  const strokesLikeSeparateChars = checkStrokesAreSeparateChars(elements);
-  console.log(`[AI] Multi-stroke: ${elements.length} strokes, separateChars=${strokesLikeSeparateChars}`);
-
-  // Shape: only try if strokes don't look like separate characters
+  // Shape recognition: combine all points
   const shapePromise = (shapeRecognitionEnabled && !strokesLikeSeparateChars)
     ? Promise.resolve().then(() => {
         const combinedPoints: LocalPoint[] = [];
@@ -237,7 +309,7 @@ export async function processFreedrawBatch(
     : Promise.resolve();
 
   // Handwriting: multi-stroke recognition
-  const hwPromise = handwritingRecognitionEnabled
+  const hwPromise = (handwritingRecognitionEnabled || arabicHandwritingEnabled)
     ? (async () => {
         const allStrokes: { points: readonly LocalPoint[]; offsetX: number; offsetY: number }[] = [];
         for (const el of elements) {
@@ -252,12 +324,17 @@ export async function processFreedrawBatch(
 
         if (allStrokes.length > 0) {
           const avgSW = elements.reduce((s, e) => s + e.strokeWidth, 0) / elements.length;
-          const result = await recognizeHandwritingMultiStroke(allStrokes, avgSW);
-          if (
-            result.text.length > 0 &&
-            result.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD
-          ) {
-            hwResult = result;
+
+          if (arabicHandwritingEnabled) {
+            const result = await recognizeArabicHandwritingMultiStroke(allStrokes, avgSW);
+            if (result.text.length > 0 && result.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD) {
+              hwResult = result;
+            }
+          } else {
+            const result = await recognizeHandwritingMultiStroke(allStrokes, avgSW);
+            if (result.text.length > 0 && result.confidence >= HANDWRITING_CONFIDENCE_THRESHOLD) {
+              hwResult = result;
+            }
           }
         }
       })()
@@ -268,12 +345,17 @@ export async function processFreedrawBatch(
   const sr = shapeResult as RecognizedShape | null;
   const hr = hwResult as HandwritingResult | null;
 
-  // Multi-stroke: prefer handwriting over shape (text is usually multi-stroke)
+  // Decision logic for multi-stroke
   if (hr && sr) {
-    // Only let shape win if it's very confident (>90%)
+    // If strokes form one connected shape, prefer shape
+    if (strokesFormOneShape && sr.confidence >= 0.75) {
+      return { type: "shape", shape: sr, consumedElements: elements };
+    }
+    // Very high confidence shape wins regardless
     if (sr.confidence >= 0.90) {
       return { type: "shape", shape: sr, consumedElements: elements };
     }
+    // Otherwise prefer handwriting for multi-stroke (text is usually multi-stroke)
     return { type: "text", handwriting: hr, consumedElements: elements };
   }
 
@@ -306,7 +388,9 @@ export async function processFreedrawBatch(
 
 export {
   preloadHandwritingEngine,
+  preloadArabicHandwritingEngine,
   terminateHandwritingEngine,
+  terminateArabicHandwritingEngine,
   type RecognizedShape,
   type RecognizedShapeType,
   type HandwritingResult,

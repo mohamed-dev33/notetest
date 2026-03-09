@@ -134,30 +134,33 @@ function vectorize(pts: Point[], orientationSensitive: boolean): number[] {
   let delta = 0;
 
   if (orientationSensitive) {
-    // Snap to nearest base orientation
     const baseOrientation = (Math.PI / 4) * Math.round(iAngle / (Math.PI / 4));
     delta = baseOrientation - iAngle;
   } else {
     delta = -iAngle;
   }
 
+  // Compute centroid ONCE (was O(n²) bug — called inside loop before)
+  const c = centroid(pts);
+  const cos = Math.cos(delta);
+  const sin = Math.sin(delta);
+
   let sum = 0;
   const vec: number[] = new Array(pts.length * 2);
 
   for (let i = 0; i < pts.length; i++) {
-    const dx = pts[i].x - centroid(pts).x;
-    const dy = pts[i].y - centroid(pts).y;
-    const cos = Math.cos(delta);
-    const sin = Math.sin(delta);
+    const dx = pts[i].x - c.x;
+    const dy = pts[i].y - c.y;
     vec[i * 2] = dx * cos - dy * sin;
     vec[i * 2 + 1] = dx * sin + dy * cos;
     sum += vec[i * 2] ** 2 + vec[i * 2 + 1] ** 2;
   }
 
-  // Normalize
   const magnitude = Math.sqrt(sum);
-  for (let i = 0; i < vec.length; i++) {
-    vec[i] /= magnitude;
+  if (magnitude > 0) {
+    for (let i = 0; i < vec.length; i++) {
+      vec[i] /= magnitude;
+    }
   }
 
   return vec;
@@ -399,20 +402,10 @@ function buildTemplates(): GestureTemplate[] {
     add("diamond", makeDiamond(w, h).reverse());
   }
 
-  // Lines — various angles (orientation-sensitive to distinguish from arrows)
-  for (const angle of [0, Math.PI / 6, Math.PI / 4, Math.PI / 3, Math.PI / 2,
-    -Math.PI / 6, -Math.PI / 4, -Math.PI / 3]) {
-    for (const len of [100, 200]) {
-      add("line", makeLine(len, angle), true);
-    }
-  }
-
-  // Arrows — various angles
-  for (const angle of [0, Math.PI / 6, Math.PI / 4, -Math.PI / 6, -Math.PI / 4, Math.PI / 2]) {
-    for (const len of [120, 200]) {
-      add("arrow", makeArrow(len, angle), true);
-    }
-  }
+  // NOTE: Lines and arrows are NOT included in Protractor templates.
+  // They are handled entirely by geometric heuristics (Phase 0) which are
+  // more accurate for open strokes. Including them here with different
+  // orientationSensitive flags would cause score comparison mismatches.
 
   return templates;
 }
@@ -478,10 +471,8 @@ function circularity(pts: Point[]): number {
 function detectCorners(pts: Point[], angleThrDeg: number = 30): number[] {
   if (pts.length < 5) { return []; }
 
-  // Compute angle at each point using a window
   const windowSize = Math.max(3, Math.floor(pts.length / 20));
-  const corners: number[] = [];
-  const angles: number[] = [];
+  const cornerCandidates: { idx: number; angle: number }[] = [];
 
   for (let i = windowSize; i < pts.length - windowSize; i++) {
     const prev = pts[i - windowSize];
@@ -493,38 +484,35 @@ function detectCorners(pts: Point[], angleThrDeg: number = 30): number[] {
     const v2x = next.x - curr.x;
     const v2y = next.y - curr.y;
 
-    const dot = v1x * v2x + v1y * v2y;
     const mag1 = Math.sqrt(v1x * v1x + v1y * v1y);
     const mag2 = Math.sqrt(v2x * v2x + v2y * v2y);
     if (mag1 < 0.001 || mag2 < 0.001) { continue; }
 
+    const dot = v1x * v2x + v1y * v2y;
     const cosAngle = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
     const angleDeg = Math.acos(cosAngle) * 180 / Math.PI;
-    angles.push(angleDeg);
 
     if (angleDeg < (180 - angleThrDeg)) {
-      corners.push(i);
+      cornerCandidates.push({ idx: i, angle: angleDeg });
     }
   }
 
-  // Remove close-together corners (non-maximum suppression)
-  const minDist = pts.length / 8;
-  const filtered: number[] = [];
-  for (const c of corners) {
-    if (filtered.length === 0 || c - filtered[filtered.length - 1] >= minDist) {
-      filtered.push(c);
+  // Non-maximum suppression — keep the sharpest corner in each neighborhood
+  const minDist = Math.max(4, pts.length / 8);
+  const filtered: { idx: number; angle: number }[] = [];
+  for (const candidate of cornerCandidates) {
+    if (filtered.length === 0 || candidate.idx - filtered[filtered.length - 1].idx >= minDist) {
+      filtered.push(candidate);
     } else {
-      // Keep the sharper corner
-      const prevIdx = filtered[filtered.length - 1];
-      const prevAngle = angles[prevIdx - Math.max(3, Math.floor(pts.length / 20))] ?? 180;
-      const currAngle = angles[c - Math.max(3, Math.floor(pts.length / 20))] ?? 180;
-      if (currAngle < prevAngle) {
-        filtered[filtered.length - 1] = c;
+      // Keep the sharper (smaller angle) corner
+      const prev = filtered[filtered.length - 1];
+      if (candidate.angle < prev.angle) {
+        filtered[filtered.length - 1] = candidate;
       }
     }
   }
 
-  return filtered;
+  return filtered.map((c) => c.idx);
 }
 
 /**
@@ -601,6 +589,103 @@ const MIN_POINTS = 5;
 const MIN_STROKE_SIZE = 15;
 
 /**
+ * Measure the angle (in degrees) at a corner point given its neighbors.
+ */
+function measureCornerAngle(pts: Point[], cornerIdx: number, windowSize: number): number {
+  const pIdx = Math.max(0, cornerIdx - windowSize);
+  const nIdx = Math.min(pts.length - 1, cornerIdx + windowSize);
+  const prev = pts[pIdx];
+  const curr = pts[cornerIdx];
+  const next = pts[nIdx];
+  const v1x = prev.x - curr.x;
+  const v1y = prev.y - curr.y;
+  const v2x = next.x - curr.x;
+  const v2y = next.y - curr.y;
+  const mag1 = Math.sqrt(v1x * v1x + v1y * v1y);
+  const mag2 = Math.sqrt(v2x * v2x + v2y * v2y);
+  if (mag1 < 0.001 || mag2 < 0.001) { return 180; }
+  const dot = v1x * v2x + v1y * v2y;
+  const cosAngle = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
+  return Math.acos(cosAngle) * 180 / Math.PI;
+}
+
+/**
+ * Compute average curvature along the path.
+ * High curvature = lots of turning, low curvature = straight or smooth.
+ */
+function averageCurvature(pts: Point[]): number {
+  if (pts.length < 3) { return 0; }
+  let totalAngle = 0;
+  let count = 0;
+  const step = Math.max(1, Math.floor(pts.length / 40));
+  for (let i = step; i < pts.length - step; i += step) {
+    const dx1 = pts[i].x - pts[i - step].x;
+    const dy1 = pts[i].y - pts[i - step].y;
+    const dx2 = pts[i + step].x - pts[i].x;
+    const dy2 = pts[i + step].y - pts[i].y;
+    const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
+    const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
+    if (len1 < 0.5 || len2 < 0.5) { continue; }
+    const dot = (dx1 * dx2 + dy1 * dy2) / (len1 * len2);
+    const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+    totalAngle += angle;
+    count++;
+  }
+  return count > 0 ? totalAngle / count : 0;
+}
+
+/**
+ * Check if corners have approximately right angles (~90°).
+ * Returns fraction of corners that are near-right-angle.
+ */
+function rightAngleFraction(pts: Point[], cornerIndices: number[]): number {
+  if (cornerIndices.length === 0) { return 0; }
+  const windowSize = Math.max(3, Math.floor(pts.length / 16));
+  let rightCount = 0;
+  for (const ci of cornerIndices) {
+    const angle = measureCornerAngle(pts, ci, windowSize);
+    // Right angle = 90° ± 30°
+    if (angle >= 60 && angle <= 120) { rightCount++; }
+  }
+  return rightCount / cornerIndices.length;
+}
+
+/**
+ * Check if the stroke has consistent curvature (circle-like)
+ * vs sharp changes (polygon-like).
+ */
+function curvatureVariance(pts: Point[]): number {
+  if (pts.length < 6) { return 0; }
+  const curvatures: number[] = [];
+  const step = Math.max(1, Math.floor(pts.length / 30));
+  for (let i = step; i < pts.length - step; i += step) {
+    const dx1 = pts[i].x - pts[i - step].x;
+    const dy1 = pts[i].y - pts[i - step].y;
+    const dx2 = pts[i + step].x - pts[i].x;
+    const dy2 = pts[i + step].y - pts[i].y;
+    const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
+    const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
+    if (len1 < 0.5 || len2 < 0.5) { continue; }
+    const dot = (dx1 * dx2 + dy1 * dy2) / (len1 * len2);
+    curvatures.push(Math.acos(Math.max(-1, Math.min(1, dot))));
+  }
+  if (curvatures.length < 2) { return 0; }
+  const mean = curvatures.reduce((s, v) => s + v, 0) / curvatures.length;
+  const variance = curvatures.reduce((s, v) => s + (v - mean) ** 2, 0) / curvatures.length;
+  return variance;
+}
+
+/**
+ * Compute perimeter-to-diameter ratio.
+ * Circle ≈ π (3.14), square ≈ 4, triangle ≈ depends on shape
+ */
+function perimeterDiameterRatio(pts: Point[], bounds: { width: number; height: number }): number {
+  const perim = pathLength(pts);
+  const diameter = Math.sqrt(bounds.width ** 2 + bounds.height ** 2);
+  return diameter > 0 ? perim / diameter : 0;
+}
+
+/**
  * Recognize a shape from freedraw points using a hybrid approach:
  * 1. Geometric analysis (corners, circularity, straightness) — primary
  * 2. Protractor template matching — secondary confirmation
@@ -641,41 +726,38 @@ export function recognizeShape(
   });
 
   // ========== Phase 0: ALWAYS try line/arrow detection first ==========
-  // This must run before closed-shape analysis because arrows with V-heads
-  // can appear "closed" but should still be recognized as arrows.
-  const straightness = closeDist / totalLen;
+  const straightness = totalLen > 0 ? closeDist / totalLen : 0;
 
-  if (straightness > 0.85) {
+  // Very straight stroke → line
+  if (straightness > 0.88) {
     return {
       type: "line",
-      confidence: Math.min(1, straightness * 1.05),
+      confidence: Math.min(1, straightness * 1.02),
       bounds: makeBounds(),
       startPoint: { x: elementX + points[0].x, y: elementY + points[0].y },
       endPoint: { x: elementX + points[points.length - 1].x, y: elementY + points[points.length - 1].y },
     };
   }
 
-  // Arrow detection — skip for clearly closed shapes (circles, rectangles)
-  // For moderately open shapes, check arrow pattern
-  // For clearly open shapes, always check
-  if (points.length >= 6 && closeness > 0.10) {
+  // Arrow detection — for open or semi-closed shapes
+  if (points.length >= 6 && closeness > 0.08) {
     const arrowResult = detectArrow(points, totalLen, elementX, elementY, bounds);
     if (arrowResult) { return arrowResult; }
   }
-  // Even for nearly-closed shapes, check elongated arrow pattern (V-head curling back)
-  if (points.length >= 6 && closeness <= 0.10) {
+  // For nearly-closed elongated shapes, check arrow pattern (V-head curling back)
+  if (points.length >= 6 && closeness <= 0.08) {
     const elongation = Math.max(bounds.width, bounds.height) / Math.max(Math.min(bounds.width, bounds.height), 1);
-    if (elongation > 2.0) {
+    if (elongation > 2.5) {
       const arrowResult = detectArrow(points, totalLen, elementX, elementY, bounds);
-      if (arrowResult && arrowResult.confidence > 0.6) { return arrowResult; }
+      if (arrowResult && arrowResult.confidence > 0.65) { return arrowResult; }
     }
   }
 
   // Moderately straight open stroke → line
-  if (!effectivelyClosed && straightness > 0.75) {
+  if (!effectivelyClosed && straightness > 0.78) {
     return {
       type: "line",
-      confidence: straightness * 0.9,
+      confidence: straightness * 0.92,
       bounds: makeBounds(),
       startPoint: { x: elementX + points[0].x, y: elementY + points[0].y },
       endPoint: { x: elementX + points[points.length - 1].x, y: elementY + points[points.length - 1].y },
@@ -683,84 +765,135 @@ export function recognizeShape(
   }
 
   // ========== Phase 1: Closed-shape geometric analysis ==========
-  // Compute metrics for shapes that are closed or nearly closed
   const analyzePoints = effectivelyClosed ? points : [...points, { ...points[0] }];
   const area = shoelaceArea(analyzePoints);
   const bbArea = bounds.width * bounds.height;
   const fillRatio = bbArea > 0 ? area / bbArea : 0;
   const circ = circularity(analyzePoints);
   const aspectRatio = bounds.width / Math.max(bounds.height, 1);
+  const elongationRatio = Math.max(bounds.width, bounds.height) / Math.max(Math.min(bounds.width, bounds.height), 1);
 
-  // Corner detection via RDP simplification
+  // Corner detection
   const epsilon = Math.max(bounds.width, bounds.height) * 0.04;
   const simplified = rdpSimplify(analyzePoints, epsilon);
   const vertexCount = simplified.length - (dist(simplified[0], simplified[simplified.length - 1]) < epsilon * 2 ? 1 : 0);
 
-  // Convex hull analysis
   const hull = convexHull(analyzePoints);
   const hullArea = shoelaceArea(hull);
   const convexity = hullArea > 0 ? area / hullArea : 0;
 
-  // Corner detection via angle changes
   const corners = detectCorners(analyzePoints, 35);
   const cornerCount = corners.length;
 
-  // Confidence multiplier for nearly-closed (not perfectly closed) strokes
+  // Advanced metrics
+  const rightAngleFrac = cornerCount > 0 ? rightAngleFraction(analyzePoints, corners) : 0;
+  const curvVar = curvatureVariance(analyzePoints);
+  const pdRatio = perimeterDiameterRatio(analyzePoints, bounds);
+
   const closedConf = effectivelyClosed ? 1.0 : 0.85;
 
   // ---- Ellipse/Circle detection ----
-  // High circularity, few/no sharp corners, high convexity
-  if (circ > 0.68 && convexity > 0.88 && cornerCount <= 2) {
+  // High circularity, low curvature variance (smooth curve), few sharp corners
+  // Key: rightAngleFrac should be LOW (ellipses don't have right angles)
+  // BUT with very few corners (<=1), rightAngleFrac is unreliable — trust circularity
+  if (circ > 0.62 && convexity > 0.85 && cornerCount <= 3 && curvVar < 0.20
+      && (cornerCount <= 1 || rightAngleFrac < 0.5)) {
     return {
       type: "ellipse",
-      confidence: Math.min(1, circ * 1.1 * closedConf),
+      confidence: Math.min(1, circ * 1.10 * closedConf),
+      bounds: makeBounds(),
+    };
+  }
+  // Fallback ellipse: good circularity even with some corners (hand-drawn wobble)
+  if (circ > 0.72 && convexity > 0.88 && curvVar < 0.12 && (cornerCount <= 1 || rightAngleFrac < 0.4)) {
+    return {
+      type: "ellipse",
+      confidence: Math.min(1, circ * 1.05 * closedConf),
       bounds: makeBounds(),
     };
   }
 
   // ---- Rectangle detection ----
-  // ~4 corners, high fill ratio
+  // ~4 corners with right angles, high fill ratio, high convexity
+  // MUST have low circularity (to exclude ellipses) and sharp corners (curvVar > threshold)
+  if (
+    cornerCount >= 3 && cornerCount <= 6 &&
+    fillRatio > 0.70 &&
+    convexity > 0.85 &&
+    rightAngleFrac >= 0.5 &&
+    circ < 0.82 &&
+    aspectRatio > 0.15 && aspectRatio < 6.0
+  ) {
+    const conf = Math.min(1, (fillRatio * 0.5 + rightAngleFrac * 0.5) * 1.05 * closedConf);
+    return {
+      type: "rectangle",
+      confidence: conf,
+      bounds: makeBounds(),
+    };
+  }
+  // Relaxed rectangle: good fill ratio but must NOT be smooth (ellipse-like)
   if (
     cornerCount >= 3 &&
-    fillRatio > 0.68 &&
-    convexity > 0.82 &&
+    fillRatio > 0.75 &&
+    convexity > 0.88 &&
+    circ < 0.80 &&
+    curvVar > 0.03 &&
     aspectRatio > 0.2 && aspectRatio < 5.0
   ) {
     return {
       type: "rectangle",
-      confidence: Math.min(1, fillRatio * 1.05 * closedConf),
+      confidence: Math.min(1, fillRatio * 1.02 * closedConf),
       bounds: makeBounds(),
     };
   }
 
-  // ---- Diamond detection (BEFORE triangle — both have ~4 corners but different fill) ----
-  // Diamond has ~4 corners, fill ratio ~0.5 (half of bounding box), near-square aspect
+  // ---- Diamond detection (BEFORE triangle) ----
+  // Diamond: ~4 corners, fill ratio ~0.5 (half of bounding box), near-square aspect
+  // Key distinguisher from rectangle: fillRatio < 0.72 (diamond fills ~50% of bbox)
+  // Note: square-aspect diamonds DO have right angles (rotated square), so we don't
+  // exclude based on rightAngleFrac.  Instead, rely on fillRatio + vertexCount.
   if (
-    cornerCount >= 3 &&
-    fillRatio > 0.32 && fillRatio < 0.68 &&
+    cornerCount >= 2 && cornerCount <= 6 &&
+    fillRatio > 0.32 && fillRatio < 0.72 &&
     convexity > 0.82 &&
-    aspectRatio > 0.4 && aspectRatio < 2.5
+    vertexCount >= 4 &&
+    aspectRatio > 0.35 && aspectRatio < 2.8
   ) {
     return {
       type: "diamond",
-      confidence: Math.min(1, convexity * 0.9 * closedConf),
+      confidence: Math.min(1, convexity * 0.95 * closedConf),
+      bounds: makeBounds(),
+    };
+  }
+  // Relaxed diamond: fewer constraints
+  if (
+    cornerCount >= 2 && cornerCount <= 6 &&
+    fillRatio > 0.30 && fillRatio < 0.72 &&
+    convexity > 0.80 &&
+    aspectRatio > 0.35 && aspectRatio < 2.8
+  ) {
+    return {
+      type: "diamond",
+      confidence: Math.min(1, convexity * 0.88 * closedConf),
       bounds: makeBounds(),
     };
   }
 
   // ---- Triangle detection ----
   // ~3 corners, lower fill ratio (~0.5), NOT elongated (elongated = arrow/line)
-  const elongationRatio = Math.max(bounds.width, bounds.height) / Math.max(Math.min(bounds.width, bounds.height), 1);
+  // Key: 3 vertices in RDP simplification, convex, not too elongated
+  // MUST have fewer vertices than diamond (3 vs 4)
   if (
     cornerCount >= 2 && cornerCount <= 4 &&
-    fillRatio > 0.20 && fillRatio < 0.68 &&
-    convexity > 0.75 &&
+    fillRatio > 0.25 && fillRatio < 0.68 &&
+    convexity > 0.78 &&
     aspectRatio > 0.35 && aspectRatio < 2.5 &&
-    elongationRatio < 2.5
+    elongationRatio < 2.2 &&
+    vertexCount >= 3 && vertexCount <= 4
   ) {
     return {
       type: "triangle",
-      confidence: Math.min(1, convexity * 0.9 * closedConf),
+      confidence: Math.min(1, convexity * 0.88 * closedConf),
       bounds: makeBounds(),
     };
   }
@@ -793,18 +926,30 @@ export function recognizeShape(
       }
     }
 
-    // Cross-validate Protractor with geometry
-    if (protoScore >= 0.45) {
+    // Cross-validate Protractor result with geometric metrics
+    if (protoScore >= 0.50) {
       let validated = protoName;
 
+      // Protractor says rectangle but fill is low → diamond or triangle
       if (protoName === "rectangle" && fillRatio < 0.55) {
         validated = fillRatio < 0.40 ? "triangle" : "diamond";
-      } else if (protoName === "ellipse" && circ < 0.55) {
-        validated = cornerCount >= 3 ? (fillRatio > 0.65 ? "rectangle" : "diamond") : "ellipse";
-      } else if (protoName === "triangle" && fillRatio > 0.75) {
+      }
+      // Protractor says ellipse but low circularity → polygon
+      else if (protoName === "ellipse" && circ < 0.60) {
+        if (cornerCount >= 3 && fillRatio > 0.65) { validated = "rectangle"; }
+        else if (cornerCount >= 3 && fillRatio > 0.35) { validated = "diamond"; }
+      }
+      // Protractor says triangle but high fill → rectangle
+      else if (protoName === "triangle" && fillRatio > 0.75) {
         validated = "rectangle";
-      } else if (protoName === "diamond" && fillRatio > 0.78) {
+      }
+      // Protractor says diamond but high fill → rectangle
+      else if (protoName === "diamond" && fillRatio > 0.78) {
         validated = "rectangle";
+      }
+      // Additional cross-validation: rectangle needs some right-angle corners
+      if (validated === "rectangle" && rightAngleFrac < 0.25 && cornerCount >= 3) {
+        validated = fillRatio < 0.55 ? "diamond" : validated;
       }
 
       return {
@@ -814,17 +959,17 @@ export function recognizeShape(
       };
     }
 
-    // Phase 4: Pure geometric fallback
-    if (circ > 0.65 && cornerCount <= 2) {
-      return { type: "ellipse", confidence: circ * closedConf, bounds: makeBounds() };
+    // Phase 4: Pure geometric fallback — more conservative thresholds
+    if (circ > 0.60 && cornerCount <= 3 && curvVar < 0.18 && (cornerCount <= 1 || rightAngleFrac < 0.5)) {
+      return { type: "ellipse", confidence: Math.min(1, circ * 1.05) * closedConf, bounds: makeBounds() };
     }
-    if (fillRatio > 0.68) {
+    if (fillRatio > 0.72 && rightAngleFrac > 0.3 && circ < 0.80) {
       return { type: "rectangle", confidence: fillRatio * closedConf, bounds: makeBounds() };
     }
-    if (fillRatio > 0.50 && aspectRatio > 0.5 && aspectRatio < 2.0) {
-      return { type: "diamond", confidence: fillRatio * closedConf, bounds: makeBounds() };
+    if (fillRatio > 0.35 && fillRatio < 0.72 && aspectRatio > 0.5 && aspectRatio < 2.0 && cornerCount >= 3 && vertexCount >= 4) {
+      return { type: "diamond", confidence: Math.max(0.5, fillRatio) * closedConf, bounds: makeBounds() };
     }
-    if (fillRatio > 0.20 && cornerCount <= 4 && elongationRatio < 2.5) {
+    if (fillRatio > 0.25 && cornerCount >= 2 && cornerCount <= 4 && elongationRatio < 2.2 && vertexCount <= 4) {
       return { type: "triangle", confidence: Math.max(0.5, convexity * 0.8) * closedConf, bounds: makeBounds() };
     }
   }
@@ -834,6 +979,10 @@ export function recognizeShape(
 
 /**
  * Detect arrows from open stroke — looks for V-shaped head at either end.
+ * Uses 3 methods for robustness:
+ *   1. Shaft+head split: find straight shaft with non-straight tail
+ *   2. Sharp angle detection: find V-turn in stroke
+ *   3. Elongated directional flow: elongated shape with consistent direction
  */
 function detectArrow(
   points: Point[],
@@ -851,40 +1000,67 @@ function detectArrow(
 
   // Method 1: Shaft+head split — scan for a straight shaft with non-straight tail
   const tryDirection = (pts: Point[], reverse: boolean): RecognizedShape | null => {
-    for (const shaftFrac of [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]) {
+    let bestConf = 0;
+    let bestResult: RecognizedShape | null = null;
+
+    for (const shaftFrac of [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]) {
       const shaftEnd = Math.floor(pts.length * shaftFrac);
-      if (shaftEnd < 3 || pts.length - shaftEnd < 3) { continue; }
+      if (shaftEnd < 4 || pts.length - shaftEnd < 4) { continue; }
 
       const shaftPts = pts.slice(0, shaftEnd + 1);
       const shaftLen = pathLength(shaftPts);
       const shaftDirect = dist(pts[0], pts[shaftEnd]);
       const shaftStraight = shaftLen > 0 ? shaftDirect / shaftLen : 0;
 
-      if (shaftStraight > 0.65) {
+      if (shaftStraight > 0.70) {
         const tailPts = pts.slice(shaftEnd);
         const tailDirect = dist(tailPts[0], tailPts[tailPts.length - 1]);
         const tailLen = pathLength(tailPts);
         const tailStraight = tailLen > 0 ? tailDirect / tailLen : 1;
 
-        // Tail should be non-straight (arrowhead bends) and at least 3% of total
-        if (tailStraight < 0.85 && tailLen > totalLen * 0.03) {
-          const startPt = reverse ? points[points.length - 1] : points[0];
-          const endPt = reverse
-            ? points[points.length - 1 - shaftEnd]
-            : points[shaftEnd];
+        // Tail should bend (arrowhead) and be at least 5% of total
+        if (tailStraight < 0.80 && tailLen > totalLen * 0.05) {
+          // Verify V-head: the tail should spread away from shaft direction
+          const shaftAngle = Math.atan2(
+            pts[shaftEnd].y - pts[0].y,
+            pts[shaftEnd].x - pts[0].x,
+          );
+          const tailEndAngle = Math.atan2(
+            tailPts[tailPts.length - 1].y - tailPts[0].y,
+            tailPts[tailPts.length - 1].x - tailPts[0].x,
+          );
+          const headDeflection = Math.abs(shaftAngle - tailEndAngle);
+          const normalizedDeflection = headDeflection > Math.PI
+            ? 2 * Math.PI - headDeflection
+            : headDeflection;
 
-          const conf = Math.min(1, shaftStraight * 0.95 + (1 - tailStraight) * 0.1);
-          return {
-            type: "arrow",
-            confidence: conf,
-            bounds: makeBounds(),
-            startPoint: { x: elementX + startPt.x, y: elementY + startPt.y },
-            endPoint: { x: elementX + endPt.x, y: elementY + endPt.y },
-          };
+          // Head should deflect at least 30° from shaft
+          if (normalizedDeflection > Math.PI / 6) {
+            const startPt = reverse ? points[points.length - 1] : points[0];
+            const endPt = reverse
+              ? points[points.length - 1 - shaftEnd]
+              : points[shaftEnd];
+
+            const conf = Math.min(1,
+              shaftStraight * 0.7 +
+              (1 - tailStraight) * 0.15 +
+              Math.min(normalizedDeflection / Math.PI, 0.15),
+            );
+            if (conf > bestConf) {
+              bestConf = conf;
+              bestResult = {
+                type: "arrow",
+                confidence: conf,
+                bounds: makeBounds(),
+                startPoint: { x: elementX + startPt.x, y: elementY + startPt.y },
+                endPoint: { x: elementX + endPt.x, y: elementY + endPt.y },
+              };
+            }
+          }
         }
       }
     }
-    return null;
+    return bestResult;
   };
 
   // Try arrowhead at end, then at start
@@ -893,21 +1069,20 @@ function detectArrow(
   const rev = tryDirection([...points].reverse(), true);
   if (rev) { return rev; }
 
-  // Method 2: Detect sharp angle change in last/first portion of stroke
-  // People often draw: straight shaft → sharp V for arrowhead
+  // Method 2: Detect sharp angle change in stroke
   const trySharpAngle = (pts: Point[], reverse: boolean): RecognizedShape | null => {
-    if (pts.length < 8) { return null; }
+    if (pts.length < 10) { return null; }
 
-    // Look at the last 40% for a sharp direction change
-    const checkStart = Math.floor(pts.length * 0.5);
+    const checkStart = Math.floor(pts.length * 0.45);
     let maxAngleChange = 0;
     let maxAngleIdx = -1;
+    const step = Math.max(2, Math.floor(pts.length / 40));
 
-    for (let i = checkStart + 2; i < pts.length - 2; i++) {
-      const dx1 = pts[i].x - pts[i - 2].x;
-      const dy1 = pts[i].y - pts[i - 2].y;
-      const dx2 = pts[i + 2].x - pts[i].x;
-      const dy2 = pts[i + 2].y - pts[i].y;
+    for (let i = checkStart + step; i < pts.length - step; i++) {
+      const dx1 = pts[i].x - pts[i - step].x;
+      const dy1 = pts[i].y - pts[i - step].y;
+      const dx2 = pts[i + step].x - pts[i].x;
+      const dy2 = pts[i + step].y - pts[i].y;
       const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
       const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
       if (len1 < 1 || len2 < 1) { continue; }
@@ -919,22 +1094,21 @@ function detectArrow(
       }
     }
 
-    // Sharp angle (> 60°) in the last portion indicates arrowhead
-    if (maxAngleChange > Math.PI / 3 && maxAngleIdx > 0) {
-      // Check shaft straightness up to the angle change
+    // Need a sharp angle (> 70°) — tighter than before to avoid false positives
+    if (maxAngleChange > Math.PI * 70 / 180 && maxAngleIdx > 0) {
       const shaftPts = pts.slice(0, maxAngleIdx + 1);
       const shaftDirect = dist(shaftPts[0], shaftPts[shaftPts.length - 1]);
       const shaftLen = pathLength(shaftPts);
       const shaftStraight = shaftLen > 0 ? shaftDirect / shaftLen : 0;
 
-      if (shaftStraight > 0.60) {
+      if (shaftStraight > 0.65) {
         const startPt = reverse ? points[points.length - 1] : points[0];
         const endIdx = reverse ? points.length - 1 - maxAngleIdx : maxAngleIdx;
         const endPt = points[endIdx];
 
         return {
           type: "arrow",
-          confidence: Math.min(1, shaftStraight * 0.85 + maxAngleChange / Math.PI * 0.15),
+          confidence: Math.min(1, shaftStraight * 0.80 + maxAngleChange / Math.PI * 0.20),
           bounds: makeBounds(),
           startPoint: { x: elementX + startPt.x, y: elementY + startPt.y },
           endPoint: { x: elementX + endPt.x, y: elementY + endPt.y },
@@ -950,29 +1124,39 @@ function detectArrow(
   if (sharpRev) { return sharpRev; }
 
   // Method 3: Elongated shape with directional flow
+  // TIGHTER than before — require higher elongation AND verify the stroke
+  // has a clear main axis with limited perpendicular spread
   const elongation = Math.max(bounds.width, bounds.height) / Math.max(Math.min(bounds.width, bounds.height), 1);
-  if (elongation > 2.5 && points.length >= 8) {
-    const q1End = Math.floor(points.length * 0.25);
-    const q3Start = Math.floor(points.length * 0.75);
-    const startCenter = {
-      x: points.slice(0, q1End).reduce((s, p) => s + p.x, 0) / q1End,
-      y: points.slice(0, q1End).reduce((s, p) => s + p.y, 0) / q1End,
-    };
-    const endCenter = {
-      x: points.slice(q3Start).reduce((s, p) => s + p.x, 0) / (points.length - q3Start),
-      y: points.slice(q3Start).reduce((s, p) => s + p.y, 0) / (points.length - q3Start),
-    };
-    const mainAxisDist = dist(startCenter, endCenter);
-    const mainAxisRatio = mainAxisDist / totalLen;
+  if (elongation > 3.0 && points.length >= 10) {
+    // Verify perpendicular spread is small relative to length
+    const mainAxis = bounds.width > bounds.height ? "horizontal" : "vertical";
+    const mainLen = mainAxis === "horizontal" ? bounds.width : bounds.height;
+    const crossLen = mainAxis === "horizontal" ? bounds.height : bounds.width;
 
-    if (mainAxisRatio > 0.30) {
-      return {
-        type: "arrow",
-        confidence: Math.min(1, mainAxisRatio * 1.2),
-        bounds: makeBounds(),
-        startPoint: { x: elementX + points[0].x, y: elementY + points[0].y },
-        endPoint: { x: elementX + points[points.length - 1].x, y: elementY + points[points.length - 1].y },
+    // Perpendicular spread must be < 30% of main axis
+    if (crossLen < mainLen * 0.30) {
+      const q1End = Math.floor(points.length * 0.25);
+      const q3Start = Math.floor(points.length * 0.75);
+      const startCenter = {
+        x: points.slice(0, q1End).reduce((s, p) => s + p.x, 0) / q1End,
+        y: points.slice(0, q1End).reduce((s, p) => s + p.y, 0) / q1End,
       };
+      const endCenter = {
+        x: points.slice(q3Start).reduce((s, p) => s + p.x, 0) / (points.length - q3Start),
+        y: points.slice(q3Start).reduce((s, p) => s + p.y, 0) / (points.length - q3Start),
+      };
+      const mainAxisDist = dist(startCenter, endCenter);
+      const mainAxisRatio = mainAxisDist / totalLen;
+
+      if (mainAxisRatio > 0.35) {
+        return {
+          type: "arrow",
+          confidence: Math.min(0.85, mainAxisRatio * 1.1),
+          bounds: makeBounds(),
+          startPoint: { x: elementX + points[0].x, y: elementY + points[0].y },
+          endPoint: { x: elementX + points[points.length - 1].x, y: elementY + points[points.length - 1].y },
+        };
+      }
     }
   }
 

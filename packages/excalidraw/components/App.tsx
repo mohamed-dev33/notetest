@@ -646,6 +646,8 @@ class App extends React.Component<AppProps, AppState> {
   private aiRecognitionTimer: ReturnType<typeof setTimeout> | null = null;
   private aiPendingElements: ExcalidrawFreeDrawElement[] = [];
   private static readonly AI_RECOGNITION_DELAY_MS = 1500;
+  // When true, clicking on empty canvas returns to freedraw (set after shape recognition)
+  private aiReturnToFreedraw = false;
 
   public flowChartCreator: FlowChartCreator = new FlowChartCreator();
   private flowChartNavigator: FlowChartNavigator = new FlowChartNavigator();
@@ -7400,6 +7402,26 @@ class App extends React.Component<AppProps, AppState> {
 
     this.clearSelectionIfNotUsingSelection();
 
+    // AI Recognition: if we just recognized a shape and are in selection tool,
+    // check if user clicked empty canvas → return to freedraw
+    if (
+      this.aiReturnToFreedraw &&
+      this.state.activeTool.type === "selection"
+    ) {
+      const hitEl = this.getElementAtPosition(
+        pointerDownState.origin.x,
+        pointerDownState.origin.y,
+      );
+      if (!hitEl) {
+        this.aiReturnToFreedraw = false;
+        this.setActiveTool({ type: "freedraw" });
+        this.setState({ selectedElementIds: {} });
+        return;
+      }
+      // Clicked on an element — clear the flag, stay in selection
+      this.aiReturnToFreedraw = false;
+    }
+
     if (this.handleSelectionOnPointerDown(event, pointerDownState)) {
       return;
     }
@@ -8557,7 +8579,7 @@ class App extends React.Component<AppProps, AppState> {
     }
 
     // Longer delay when handwriting is enabled so user can finish words
-    const delay = this.state.aiHandwritingRecognitionEnabled
+    const delay = (this.state.aiHandwritingRecognitionEnabled || this.state.aiArabicHandwritingEnabled)
       ? 2000
       : 800;
 
@@ -8586,6 +8608,16 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
+    // If user clicked stop while debounce was pending, bail out
+    if (
+      !this.state.aiShapeRecognitionEnabled &&
+      !this.state.aiHandwritingRecognitionEnabled &&
+      !this.state.aiArabicHandwritingEnabled
+    ) {
+      this.setToast({ message: "" });
+      return;
+    }
+
     this.setToast({
       message: "🧠 Recognizing...",
       closable: false,
@@ -8598,7 +8630,9 @@ class App extends React.Component<AppProps, AppState> {
         elements,
         this.state.aiShapeRecognitionEnabled,
         this.state.aiHandwritingRecognitionEnabled,
+        this.state.aiArabicHandwritingEnabled,
       );
+
 
       if (result.type === "none") {
         this.setToast({ message: "" });
@@ -8809,7 +8843,10 @@ class App extends React.Component<AppProps, AppState> {
 
     this.scene.insertElement(replacementElement);
 
-    // Select the new shape so its properties panel shows (stay on freedraw tool)
+    // Switch to selection tool so user can control the shape's properties.
+    // Set flag to return to freedraw on next click in empty area.
+    this.setActiveTool({ type: "selection" });
+    this.aiReturnToFreedraw = true;
     this.setState({
       selectedElementIds: { [replacementElement.id]: true },
     });
@@ -8852,6 +8889,10 @@ class App extends React.Component<AppProps, AppState> {
 
     const estimatedFontSize = Math.max(16, Math.min(72, totalHeight * 0.7));
 
+    // Detect Arabic text for RTL alignment
+    const hasArabic = /[\u0600-\u06FF]/.test(text);
+    const textAlign = hasArabic ? "right" : this.state.currentItemTextAlign;
+
     const textElement = newTextElement({
       x: globalMinX,
       y: globalMinY,
@@ -8867,7 +8908,7 @@ class App extends React.Component<AppProps, AppState> {
       text,
       fontSize: estimatedFontSize,
       fontFamily: this.state.currentItemFontFamily,
-      textAlign: this.state.currentItemTextAlign,
+      textAlign,
       angle: 0 as Radians,
     });
 
@@ -10663,7 +10704,8 @@ class App extends React.Component<AppProps, AppState> {
         // (waits for user to finish all strokes before recognizing)
         if (
           this.state.aiShapeRecognitionEnabled ||
-          this.state.aiHandwritingRecognitionEnabled
+          this.state.aiHandwritingRecognitionEnabled ||
+          this.state.aiArabicHandwritingEnabled
         ) {
           this.queueAIRecognition(newElement);
         }

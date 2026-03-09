@@ -130,6 +130,7 @@ export const getDefaultAppState = (): Omit<
     bindMode: "orbit",
     aiShapeRecognitionEnabled: false,
     aiHandwritingRecognitionEnabled: false,
+    aiArabicHandwritingEnabled: false,
     aiRecognitionPending: null,
   };
 };
@@ -259,6 +260,7 @@ const APP_STATE_STORAGE_CONF = (<
   bindMode: { browser: true, export: false, server: false },
   aiShapeRecognitionEnabled: { browser: true, export: false, server: false },
   aiHandwritingRecognitionEnabled: { browser: true, export: false, server: false },
+  aiArabicHandwritingEnabled: { browser: true, export: false, server: false },
   aiRecognitionPending: { browser: false, export: false, server: false },
 });
 
